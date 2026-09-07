@@ -141,16 +141,21 @@ def test_deduplicate_terminates_through_a_long_run_of_existing_suffixes():
     assert result == Path("/out/a-500.pdf")
 
 
-def test_deduplicate_treats_differently_cased_paths_as_distinct():
-    # FINDING: macOS's default filesystem (APFS/HFS+) is case-insensitive, so
-    # "Talk.pdf" and "talk.pdf" name the same file there. `deduplicate` compares
-    # `Path` objects, whose equality is case-sensitive, so it does not detect
-    # this collision and returns the lowercase path unchanged even though the
-    # uppercase variant is "taken". This is reported, not fixed, per the task
-    # brief; folding case into the collision check would change behavior on
-    # Linux too and needs an explicit decision.
-    taken = {Path("/out/Talk.pdf")}
-    assert deduplicate(Path("/out/talk.pdf"), taken) == Path("/out/talk.pdf")
+def test_deduplicate_folds_case_when_detecting_a_collision():
+    # On a case-insensitive filesystem (e.g. macOS's default APFS/HFS+),
+    # "Talk.pdf" and "talk.pdf" name the same file. `deduplicate` folds case so
+    # it treats them as one, rather than handing back two "free" paths that
+    # would silently overwrite each other on disk.
+    taken = {Path("/out/talk.pdf")}
+    assert deduplicate(Path("/out/Talk.pdf"), taken) == Path("/out/Talk-2.pdf")
+
+
+def test_deduplicate_folds_case_through_a_suffix_chain():
+    # The suffix search must also fold case at each step, not just on the
+    # initial lookup, or it would stop at "-2" without recognizing that a
+    # differently-cased "-2" variant is already taken.
+    taken = {Path("/out/talk.pdf"), Path("/out/TALK-2.pdf")}
+    assert deduplicate(Path("/out/Talk.pdf"), taken) == Path("/out/Talk-3.pdf")
 
 
 def test_the_captured_event_produces_collision_free_usable_destinations():

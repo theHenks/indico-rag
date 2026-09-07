@@ -57,12 +57,19 @@ def destination(root: Path, event: Event, day: Day, session: Session, talk: Talk
 
 
 def deduplicate(path: Path, taken: set[Path]) -> Path:
-    """Return `path`, or the first free `<stem>-<n>` variant when it is already taken."""
-    if path not in taken:
+    """Return `path`, or the first free `<stem>-<n>` variant when it is already taken.
+
+    Comparison folds case. On a case-insensitive filesystem two names differing
+    only in case are one file, so treating them as distinct would let one talk
+    silently overwrite another; folding case also makes the output identical on
+    every platform.
+    """
+    claimed = {str(existing).casefold() for existing in taken}
+    if str(path).casefold() not in claimed:
         return path
     counter = 2
     while True:
         candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
-        if candidate not in taken:
+        if str(candidate).casefold() not in claimed:
             return candidate
         counter += 1
