@@ -112,12 +112,39 @@ def test_deleting_a_scan_removes_it_from_the_index(tmp_path):
     assert list_scans(root=tmp_path) == []
 
 
+def test_deleting_a_scan_leaves_sibling_scans_intact(tmp_path):
+    save_scan(_event(), root=tmp_path)
+    other = _event()
+    other.id = "60000"
+    save_scan(other, root=tmp_path)
+
+    delete_scan("https://agenda.infn.it", "50058", root=tmp_path)
+
+    ids = {r.event_id for r in list_scans(root=tmp_path)}
+    assert ids == {"60000"}
+    event, _record = load_scan("https://agenda.infn.it", "60000", root=tmp_path)
+    assert event.all_talks()[0].title == "Welcome"
+
+
 def test_tokens_round_trip_and_the_file_is_owner_only(tmp_path):
     set_token("https://indico.cern.ch", "secret", root=tmp_path)
     assert get_token("https://indico.cern.ch", root=tmp_path) == "secret"
     assert get_token("https://other.example", root=tmp_path) is None
     mode = (tmp_path / "credentials.json").stat().st_mode
     assert stat.S_IMODE(mode) == 0o600
+
+
+def test_set_token_narrows_a_pre_existing_world_readable_file(tmp_path):
+    path = tmp_path / "credentials.json"
+    path.write_text(json.dumps({"old.example": "old-secret"}))
+    path.chmod(0o644)
+
+    set_token("https://indico.cern.ch", "secret", root=tmp_path)
+
+    mode = path.stat().st_mode
+    assert stat.S_IMODE(mode) == 0o600
+    assert get_token("https://old.example", root=tmp_path) == "old-secret"
+    assert get_token("https://indico.cern.ch", root=tmp_path) == "secret"
 
 
 def test_a_scan_file_never_contains_a_token(tmp_path):

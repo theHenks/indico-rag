@@ -245,6 +245,18 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write text to a file no one but its owner can read.
+
+    The mode is supplied to open(2) so the file is never created readable and
+    then narrowed; chmod additionally covers a file that already exists.
+    """
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(text)
+    os.chmod(path, 0o600)
+
+
 def get_token(host: str, root: Path | None = None) -> str | None:
     return _read_json(state_root(root) / "credentials.json").get(_host_key(host))
 
@@ -253,8 +265,7 @@ def set_token(host: str, token: str, root: Path | None = None) -> None:
     path = state_root(root) / "credentials.json"
     data = _read_json(path)
     data[_host_key(host)] = token
-    path.write_text(json.dumps(data, indent=2))
-    os.chmod(path, 0o600)
+    _write_private(path, json.dumps(data, indent=2))
 
 
 def get_host_regime(host: str, root: Path | None = None) -> str | None:
