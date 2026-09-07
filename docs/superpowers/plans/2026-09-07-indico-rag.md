@@ -832,10 +832,17 @@ Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
   - `Event.all_talks() -> list[Talk]`
   - `endpoints.parse_event_ref(text: str, default_host: str | None = None) -> tuple[str, str]` returning `(host, event_id)`
   - `endpoints.timetable_path(event_id) -> str`, `endpoints.contributions_path(event_id) -> str`
-  - `parser.attachments_by_contribution(event_export: dict) -> dict[str, list[Attachment]]`
+  - `parser.attachments_by_contribution(event_export: dict) -> dict[str, list[Attachment]]` keyed by the export's `db_id`
   - `parser.parse_timetable(timetable: dict, *, host: str, event_id: str, event_title: str, attachments: dict[str, list[Attachment]] | None = None) -> Event`
 
-**Note on fixture shape:** Task 1's capture is the authoritative record of Indico's wire format. The code below targets the documented shape and reads every field with `.get()`. If the fixture disagrees, adapt the field names in `parser.py` — the fixture-backed test in Step 1 is what catches the mismatch.
+**Fixture shape, verified against Task 1's capture of event 50058 (NOW 2026, 100 talks).** These are observed facts, not assumptions:
+
+- The two exports use **different contribution identifiers**. The timetable entry carries `contributionId` (e.g. `299881`, an int); the contributions export carries `id` (a *friendly* id like `"297"`) **and** `db_id` (`299922`). Joining on `id` yields **0 matches out of 100**; joining on `db_id` yields **100**. Key the attachment map on `db_id`.
+- Inline timetable attachments are a **dict**, `{"files": [...], "folders": [...]}`, not a list of folders. Their entries carry only `title` and a **site-relative** `download_url`.
+- Export attachments carry the full metadata: absolute `download_url`, `filename`, `content_type`, `size`, `modified_dt`, `checksum`. **Prefer the export and fall back to inline**, because ranking needs upload time and the manifest needs size and content type.
+- A folder's `title` may be `null`; coerce it to `""`.
+- Presenters use `firstName` / `familyName` (plus a combined `name`). Surnames can be multi-word ("Colomer Molla"), so the parser records them rather than letting a later component split on whitespace.
+- `track` and `type` are `null` for every contribution in this event. That is legitimate; the filter facets simply come up empty.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -904,10 +911,17 @@ SYNTHETIC = {
                             "startDate": {"date": "2026-08-31", "time": "09:00:00"},
                             "endDate": {"date": "2026-08-31", "time": "09:30:00"},
                             "presenters": [
-                                {"first_name": "Maria", "last_name": "Rossi",
-                                 "affiliation": "INFN"}
+                                {"firstName": "Maria", "familyName": "Colomer Rossi",
+                                 "affiliation": "INFN", "name": "Colomer Rossi, Maria"}
                             ],
-                            "url": "https://agenda.infn.it/event/50058/contributions/11/",
+                            "url": "/event/50058/contributions/11/",
+                            "attachments": {
+                                "files": [
+                                    {"id": "800", "title": "inline.pdf",
+                                     "download_url": "/event/50058/x/inline.pdf"}
+                                ],
+                                "folders": [],
+                            },
                         },
                         "b1": {
                             "entryType": "Break",
@@ -936,7 +950,8 @@ EXPORT = {
         {
             "contributions": [
                 {
-                    "id": "11",
+                    "id": "9",
+                    "db_id": 11,
                     "folders": [
                         {
                             "title": "Slides",
@@ -949,6 +964,7 @@ EXPORT = {
                                     "size": 12345,
                                     "content_type": "application/pdf",
                                     "type": "file",
+                                    "modified_dt": "2026-08-20T10:00:00+00:00",
                                 }
                             ],
                         }
@@ -988,12 +1004,15 @@ def test_speakers_and_times_are_parsed():
         SYNTHETIC, host="https://agenda.infn.it", event_id="50058", event_title="Workshop"
     )
     talk = next(t for t in event.all_talks() if t.title == "Welcome and Overview")
-    assert talk.speakers == ["Maria Rossi"]
+    assert talk.speakers == ["Maria Colomer Rossi"]
+    # Multi-word surnames must survive; splitting a full name on whitespace loses them.
+    assert talk.speaker_surnames == ["Colomer Rossi"]
     assert talk.affiliations == ["INFN"]
     assert talk.start.strftime("%H%M") == "0900"
 
 
-def test_attachments_are_joined_onto_talks_by_contribution_id():
+def test_attachments_are_joined_on_db_id_not_the_friendly_id():
+    # The export's own `id` is a friendly number matching nothing in the timetable.
     attachments = attachments_by_contribution(EXPORT)
     assert set(attachments) == {"11"}
     event = parse_timetable(
@@ -1005,8 +1024,31 @@ def test_attachments_are_joined_onto_talks_by_contribution_id():
     )
     talk = next(t for t in event.all_talks() if t.contribution_id == "11")
     assert len(talk.attachments) == 1
+    # The export wins over the inline copy: it carries size and content type.
     assert talk.attachments[0].filename == "welcome.pdf"
     assert talk.attachments[0].folder_title == "Slides"
+    assert talk.attachments[0].size == 12345
+
+
+def test_inline_timetable_attachments_are_used_when_the_export_lacks_the_talk():
+    event = parse_timetable(
+        SYNTHETIC, host="https://agenda.infn.it", event_id="50058", event_title="Workshop",
+        attachments={},
+    )
+    talk = next(t for t in event.all_talks() if t.contribution_id == "11")
+    assert [a.filename for a in talk.attachments] == ["inline.pdf"]
+
+
+def test_a_null_folder_title_becomes_an_empty_string():
+    export = {"results": [{"contributions": [
+        {"db_id": 11, "folders": [
+            {"title": None, "attachments": [
+                {"id": "1", "filename": "a.pdf", "download_url": "https://x/a.pdf",
+                 "type": "file"}
+            ]}
+        ]}
+    ]}]}
+    assert attachments_by_contribution(export)["11"][0].folder_title == ""
 
 
 def test_the_captured_event_parses_into_a_non_empty_agenda():
@@ -1024,6 +1066,11 @@ def test_the_captured_event_parses_into_a_non_empty_agenda():
     assert talks, "the captured timetable produced no talks"
     assert all(t.title for t in talks), "every talk must have a title"
     assert any(t.attachments for t in talks), "no talk in the capture has attachments"
+    # The join must actually land on the export, whose attachments carry size.
+    # Joining on the wrong identifier yields inline-only attachments with no size.
+    assert any(a.size for t in talks for a in t.attachments), \
+        "attachments carry no size: the export join failed"
+    assert len(talks) == 100, f"expected 100 talks in the capture, got {len(talks)}"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1068,6 +1115,7 @@ class Talk:
     end: datetime | None
     abstract: str = ""
     speakers: list[str] = field(default_factory=list)
+    speaker_surnames: list[str] = field(default_factory=list)
     affiliations: list[str] = field(default_factory=list)
     track: str = ""
     contribution_type: str = ""
@@ -1174,19 +1222,35 @@ def _timestamp(block: dict | None) -> datetime | None:
         return None
 
 
+def _surname(person: dict) -> str:
+    """Indico spells this familyName in timetable entries and last_name in exports."""
+    for key in ("familyName", "last_name", "lastName"):
+        value = person.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def _person_name(person: dict) -> str:
-    explicit = person.get("fullName") or person.get("name")
-    if explicit:
-        return str(explicit).strip()
-    first = person.get("first_name") or person.get("firstName") or ""
-    last = person.get("last_name") or person.get("lastName") or ""
-    return f"{first} {last}".strip()
+    first = person.get("firstName") or person.get("first_name") or ""
+    last = _surname(person)
+    if first or last:
+        return f"{first} {last}".strip()
+    explicit = person.get("name") or person.get("fullName") or ""
+    return str(explicit).strip()
 
 
 def _attachment(raw: dict, folder_title: str) -> Attachment:
     kind = "link" if raw.get("type") == "link" or raw.get("link_url") else "file"
     url = raw.get("download_url") or raw.get("link_url") or raw.get("url") or ""
     filename = raw.get("filename") or raw.get("title") or url.rsplit("/", 1)[-1] or "attachment"
+    modified = raw.get("modified_dt")
+    uploaded = None
+    if isinstance(modified, str):
+        try:
+            uploaded = datetime.fromisoformat(modified)
+        except ValueError:
+            uploaded = None
     return Attachment(
         id=str(raw.get("id", "")),
         filename=filename,
@@ -1194,8 +1258,8 @@ def _attachment(raw: dict, folder_title: str) -> Attachment:
         url=url,
         size=raw.get("size"),
         content_type=raw.get("content_type"),
-        uploaded=_timestamp(raw.get("modified_dt")) if isinstance(raw.get("modified_dt"), dict) else None,
-        folder_title=folder_title,
+        uploaded=uploaded,
+        folder_title=folder_title or "",
     )
 
 
@@ -1204,7 +1268,9 @@ def attachments_by_contribution(event_export: dict) -> dict[str, list[Attachment
     found: dict[str, list[Attachment]] = {}
     for result in event_export.get("results", []):
         for contribution in result.get("contributions", []):
-            key = str(contribution.get("id", ""))
+            # db_id is the identifier the timetable calls contributionId; the
+            # export's own `id` is a friendly number that matches nothing.
+            key = str(contribution.get("db_id") or contribution.get("id", ""))
             items: list[Attachment] = []
             for folder in contribution.get("folders", []):
                 folder_title = folder.get("title", "")
@@ -1219,12 +1285,21 @@ def _talk(entry: dict, session_title: str, synthetic: bool,
           attachments: dict[str, list[Attachment]] | None) -> Talk:
     contribution_id = str(entry.get("contributionId") or entry.get("db_id") or entry.get("id", ""))
     presenters = entry.get("presenters") or entry.get("speakers") or []
-    inline: list[Attachment] = []
-    for folder in entry.get("folders", []):
-        for raw in folder.get("attachments", []):
-            inline.append(_attachment(raw, folder.get("title", "")))
 
-    resolved = inline or (attachments or {}).get(contribution_id, [])
+    # Inline timetable attachments are {"files": [...], "folders": [...]}, and
+    # carry only a title and a site-relative URL.
+    inline: list[Attachment] = []
+    block = entry.get("attachments") or {}
+    if isinstance(block, dict):
+        for raw in block.get("files", []) or []:
+            inline.append(_attachment(raw, ""))
+        for folder in block.get("folders", []) or []:
+            for raw in folder.get("attachments", []) or []:
+                inline.append(_attachment(raw, folder.get("title") or ""))
+
+    # The export wins: it carries size, content type and upload time, which
+    # ranking and the manifest both need.
+    resolved = (attachments or {}).get(contribution_id) or inline
     return Talk(
         id=str(entry.get("id", "")),
         contribution_id=contribution_id,
@@ -1233,6 +1308,7 @@ def _talk(entry: dict, session_title: str, synthetic: bool,
         end=_timestamp(entry.get("endDate")),
         abstract=entry.get("description", "") or "",
         speakers=[_person_name(p) for p in presenters if _person_name(p)],
+        speaker_surnames=[_surname(p) for p in presenters if _surname(p)],
         affiliations=[p.get("affiliation", "") for p in presenters if p.get("affiliation")],
         track=entry.get("track", "") or "",
         contribution_type=entry.get("type", "") or "",
@@ -1559,7 +1635,8 @@ def _event() -> Event:
                             size=10, content_type="application/pdf")
     talk = Talk(id="c1", contribution_id="11", title="Welcome",
                 start=datetime(2026, 8, 31, 9, 0), end=datetime(2026, 8, 31, 9, 30),
-                speakers=["Maria Rossi"], attachments=[attachment], chosen=attachment)
+                speakers=["Maria Colomer Rossi"], speaker_surnames=["Colomer Rossi"],
+                attachments=[attachment], chosen=attachment)
     session = Session(id="s1", title="Plenary", slug="plenary", talks=[talk])
     return Event(id="50058", host="https://agenda.infn.it", title="Workshop", slug="workshop",
                  days=[Day(date=date(2026, 8, 31), sessions=[session])])
@@ -1584,6 +1661,7 @@ def test_event_round_trips_through_json():
     restored = event_from_jsonable(event_to_jsonable(_event()))
     talk = restored.all_talks()[0]
     assert talk.title == "Welcome"
+    assert talk.speaker_surnames == ["Colomer Rossi"], "surnames must survive a round trip"
     assert talk.start == datetime(2026, 8, 31, 9, 0)
     assert restored.days[0].date == date(2026, 8, 31)
     assert talk.chosen is not None and talk.chosen.filename == "deck.pdf"
@@ -1737,6 +1815,7 @@ def event_to_jsonable(event: Event) -> dict:
                                 "id": t.id, "contribution_id": t.contribution_id,
                                 "title": t.title, "start": _dt(t.start), "end": _dt(t.end),
                                 "abstract": t.abstract, "speakers": t.speakers,
+                                "speaker_surnames": t.speaker_surnames,
                                 "affiliations": t.affiliations, "track": t.track,
                                 "contribution_type": t.contribution_type, "url": t.url,
                                 "session_title": t.session_title,
@@ -1768,6 +1847,7 @@ def event_from_jsonable(data: dict) -> Event:
                     id=rt["id"], contribution_id=rt["contribution_id"], title=rt["title"],
                     start=_undt(rt.get("start")), end=_undt(rt.get("end")),
                     abstract=rt.get("abstract", ""), speakers=rt.get("speakers", []),
+                    speaker_surnames=rt.get("speaker_surnames", []),
                     affiliations=rt.get("affiliations", []), track=rt.get("track", ""),
                     contribution_type=rt.get("contribution_type", ""), url=rt.get("url", ""),
                     session_title=rt.get("session_title", ""),
@@ -2226,7 +2306,14 @@ def test_sanitize_never_returns_empty():
 
 def test_speaker_component_uses_the_first_speakers_surname():
     _, _, _, talk = _fixture(speakers=("Maria Rossi", "Li Chen"))
+    talk.speaker_surnames = ["Rossi", "Chen"]
     assert speaker_component(talk) == "Rossi"
+
+
+def test_speaker_component_keeps_a_multi_word_surname():
+    _, _, _, talk = _fixture(speakers=("Marta Colomer Molla",))
+    talk.speaker_surnames = ["Colomer Molla"]
+    assert speaker_component(talk) == "Colomer-Molla"
 
 
 def test_speaker_component_is_empty_without_speakers():
@@ -2295,9 +2382,16 @@ def sanitize(text: str, *, max_length: int = 80) -> str:
 
 
 def speaker_component(talk: Talk) -> str:
-    if not talk.speakers:
-        return ""
-    return sanitize(talk.speakers[0].split()[-1], max_length=40)
+    """The first speaker's surname.
+
+    Uses the surname Indico reported rather than the last whitespace-separated
+    word of the full name, which would turn "Colomer Molla" into "Molla".
+    """
+    if talk.speaker_surnames:
+        return sanitize(talk.speaker_surnames[0], max_length=40)
+    if talk.speakers:
+        return sanitize(talk.speakers[0].split()[-1], max_length=40)
+    return ""
 
 
 def event_dir(root: Path, event: Event) -> Path:
