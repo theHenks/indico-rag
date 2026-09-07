@@ -133,3 +133,40 @@ async def test_stream_to_writes_a_genuine_html_attachment(tmp_path):
 
     assert written == len(html_body)
     assert dest.read_bytes() == html_body
+
+
+@respx.mock
+async def test_stream_to_writes_a_payload_larger_than_one_chunk(tmp_path):
+    # Past the 65536-byte chunk size, so the async-for continuation past the
+    # first peeked chunk actually runs.
+    body = bytes(range(256)) * 300
+    respx.get(f"{HOST}/").mock(return_value=httpx.Response(200, json={"results": {}}))
+    respx.get(f"{HOST}/files/big.pdf").mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"content-type": "application/pdf"}
+        )
+    )
+
+    dest = tmp_path / "big.pdf"
+    async with IndicoClient(HOST) as client:
+        written = await client.stream_to("/files/big.pdf", dest)
+
+    assert written == len(body)
+    assert dest.read_bytes() == body
+
+
+@respx.mock
+async def test_stream_to_handles_an_empty_body(tmp_path):
+    respx.get(f"{HOST}/").mock(return_value=httpx.Response(200, json={"results": {}}))
+    respx.get(f"{HOST}/files/empty.pdf").mock(
+        return_value=httpx.Response(
+            200, content=b"", headers={"content-type": "application/pdf"}
+        )
+    )
+
+    dest = tmp_path / "empty.pdf"
+    async with IndicoClient(HOST) as client:
+        written = await client.stream_to("/files/empty.pdf", dest)
+
+    assert written == 0
+    assert dest.exists() and dest.read_bytes() == b""
