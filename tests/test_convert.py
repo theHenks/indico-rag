@@ -1,5 +1,4 @@
 import asyncio
-import shutil
 import zipfile
 from pathlib import Path
 
@@ -14,9 +13,7 @@ from indico_rag.pipeline.convert import (
     needs_conversion,
 )
 
-_SOFFICE_INSTALLED = shutil.which("soffice") is not None or Path(
-    "/Applications/LibreOffice.app/Contents/MacOS/soffice"
-).exists()
+_SOFFICE_INSTALLED = convert.find_soffice() is not None
 
 _CONTENT_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content
@@ -136,6 +133,37 @@ async def test_soffice_is_invoked_with_a_private_profile(tmp_path, monkeypatch):
     assert len(profile_args) == 1, "each conversion must get its own LibreOffice profile"
     assert profile_args[0].endswith("lo-profile-3")
     assert "--headless" in recorded["args"]
+
+
+async def test_keynote_is_invoked_with_source_and_destination_paths(tmp_path, monkeypatch):
+    source = tmp_path / "deck.key"
+    source.write_bytes(b"stub")
+    recorded: dict = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            source.with_suffix(".pdf").write_bytes(b"%PDF-1.4 stub")
+            return b"", b""
+
+        def kill(self):  # pragma: no cover - not reached in this test
+            pass
+
+    async def fake_exec(*args, **kwargs):
+        recorded["args"] = args
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await convert_to_pdf(source)
+
+    assert result == source.with_suffix(".pdf")
+    args = recorded["args"]
+    assert args[0] == "osascript"
+    assert args[1] == "-e"
+    assert "export doc to dst as PDF" in args[2]
+    assert args[-2:] == (str(source), str(source.with_suffix(".pdf")))
 
 
 async def test_a_hanging_soffice_is_killed_and_reported(tmp_path, monkeypatch):
