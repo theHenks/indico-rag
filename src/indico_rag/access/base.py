@@ -27,6 +27,10 @@ class AuthRequired(Exception):
         self.host = host
 
 
+def looks_like_login(text: str) -> bool:
+    return _LOGIN_RE.search(text) is not None
+
+
 def classify(response: httpx.Response) -> Regime:
     if response.status_code in (401, 403):
         return Regime.AUTH_REQUIRED
@@ -38,6 +42,6 @@ def classify(response: httpx.Response) -> Regime:
     body = response.text
     if is_interstitial(body):
         return Regime.PROOF_OF_WORK
-    if _LOGIN_RE.search(body):
+    if looks_like_login(body):
         return Regime.AUTH_REQUIRED
     return Regime.OPEN

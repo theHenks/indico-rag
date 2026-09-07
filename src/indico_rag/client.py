@@ -9,7 +9,7 @@ from types import TracebackType
 import httpx
 
 from indico_rag.access import anubis
-from indico_rag.access.base import AuthRequired, Regime, classify
+from indico_rag.access.base import AuthRequired, Regime, classify, looks_like_login
 from indico_rag.access.token import apply_token
 
 USER_AGENT = "indico-rag/0.1 (+https://github.com/theHenks/indico-rag)"
@@ -50,11 +50,45 @@ class IndicoClient:
     async def stream_to(self, url: str, dest: Path) -> int:
         """Stream a URL into `dest`, returning the number of bytes written."""
         await self._ensure_prepared(url)
-        written = 0
+        written = await self._stream_checked(url, dest)
+        if written is not None:
+            return written
+
+        # The body was a challenge or a login page rather than the file. Anubis
+        # answers with status 200, so writing it would leave HTML in a .pdf.
+        await self._request("GET", url)
+        written = await self._stream_checked(url, dest)
+        if written is None:
+            raise anubis.ChallengeParseError(
+                f"{url} still answers with a challenge after a solved proof of work"
+            )
+        return written
+
+    async def _stream_checked(self, url: str, dest: Path) -> int | None:
+        """Stream `url` into `dest`, or return None if the body is a challenge page.
+
+        Only HTML bodies are inspected: an attachment may legitimately be an HTML
+        file, and a real one carries none of Anubis's markers.
+        """
         async with self._client.stream("GET", url) as response:
             response.raise_for_status()
+            chunks = response.aiter_bytes(chunk_size=65536)
+            try:
+                first = await anext(chunks)
+            except StopAsyncIteration:
+                first = b""
+
+            if "html" in response.headers.get("content-type", ""):
+                text = first.decode("utf-8", errors="replace")
+                if anubis.is_interstitial(text) or looks_like_login(text):
+                    return None
+
+            written = 0
             with dest.open("wb") as handle:
-                async for chunk in response.aiter_bytes(chunk_size=65536):
+                if first:
+                    handle.write(first)
+                    written += len(first)
+                async for chunk in chunks:
                     handle.write(chunk)
                     written += len(chunk)
         return written

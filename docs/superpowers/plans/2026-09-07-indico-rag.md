@@ -647,6 +647,10 @@ class AuthRequired(Exception):
         self.host = host
 
 
+def looks_like_login(text: str) -> bool:
+    return _LOGIN_RE.search(text) is not None
+
+
 def classify(response: httpx.Response) -> Regime:
     if response.status_code in (401, 403):
         return Regime.AUTH_REQUIRED
@@ -692,7 +696,7 @@ from types import TracebackType
 import httpx
 
 from indico_rag.access import anubis
-from indico_rag.access.base import AuthRequired, Regime, classify
+from indico_rag.access.base import AuthRequired, Regime, classify, looks_like_login
 from indico_rag.access.token import apply_token
 
 USER_AGENT = "indico-rag/0.1 (+https://github.com/theHenks/indico-rag)"
@@ -732,11 +736,45 @@ class IndicoClient:
     async def stream_to(self, url: str, dest: Path) -> int:
         """Stream a URL into `dest`, returning the number of bytes written."""
         await self._ensure_prepared(url)
-        written = 0
+        written = await self._stream_checked(url, dest)
+        if written is not None:
+            return written
+
+        # The body was a challenge or a login page rather than the file. Anubis
+        # answers with status 200, so writing it would leave HTML in a .pdf.
+        await self._request("GET", url)
+        written = await self._stream_checked(url, dest)
+        if written is None:
+            raise anubis.ChallengeParseError(
+                f"{url} still answers with a challenge after a solved proof of work"
+            )
+        return written
+
+    async def _stream_checked(self, url: str, dest: Path) -> int | None:
+        """Stream `url` into `dest`, or return None if the body is a challenge page.
+
+        Only HTML bodies are inspected: an attachment may legitimately be an HTML
+        file, and a real one carries none of Anubis's markers.
+        """
         async with self._client.stream("GET", url) as response:
             response.raise_for_status()
+            chunks = response.aiter_bytes(chunk_size=65536)
+            try:
+                first = await anext(chunks)
+            except StopAsyncIteration:
+                first = b""
+
+            if "html" in response.headers.get("content-type", ""):
+                text = first.decode("utf-8", errors="replace")
+                if anubis.is_interstitial(text) or looks_like_login(text):
+                    return None
+
+            written = 0
             with dest.open("wb") as handle:
-                async for chunk in response.aiter_bytes(chunk_size=65536):
+                if first:
+                    handle.write(first)
+                    written += len(first)
+                async for chunk in chunks:
                     handle.write(chunk)
                     written += len(chunk)
         return written
@@ -769,13 +807,18 @@ class IndicoClient:
 
         return response
 
-    async def _solve(self, response: httpx.Response) -> None:
-        async with self._solve_lock:
-            probe = await self._client.get(str(response.url))
-            if not anubis.is_interstitial(probe.text):
-                return  # another coroutine solved it while this one waited
+    async def _solve(self, response: httpx.Response, issued_at: float) -> None:
+        """Solve the challenge in `response` unless it is already stale.
 
-            challenge = anubis.parse_challenge(probe.text)
+        `issued_at` is when the request that produced `response` was sent. The
+        cookie is host-wide, so a challenge issued before the last successful
+        solve is already answered and needs no further proof of work.
+        """
+        async with self._solve_lock:
+            if self._last_solved_at is not None and self._last_solved_at > issued_at:
+                return
+
+            challenge = anubis.parse_challenge(response.text)
             started = time.monotonic()
             digest, nonce = await asyncio.to_thread(
                 anubis.solve, challenge.challenge, challenge.difficulty
