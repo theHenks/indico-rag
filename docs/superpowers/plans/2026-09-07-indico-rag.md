@@ -430,10 +430,12 @@ def parse_challenge(html: str) -> AnubisChallenge:
     prefix_match = _PREFIX_RE.search(html)
     prefix = ""
     if prefix_match is not None:
+        # An absent prefix block legitimately means the empty prefix; a present
+        # but unparseable one means the page is not what we think it is.
         try:
             prefix = json.loads(prefix_match.group(1)) or ""
-        except json.JSONDecodeError:
-            prefix = ""
+        except json.JSONDecodeError as exc:
+            raise ChallengeParseError(f"malformed anubis_base_prefix block: {exc}") from exc
 
     return AnubisChallenge(challenge=challenge, challenge_id=challenge_id,
                            difficulty=difficulty, base_prefix=prefix)
