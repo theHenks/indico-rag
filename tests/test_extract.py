@@ -1,4 +1,3 @@
-import shutil
 import subprocess
 import zipfile
 from pathlib import Path
@@ -6,13 +5,10 @@ from pathlib import Path
 import pypdfium2
 import pytest
 
+from indico_rag.pipeline import convert
 from indico_rag.pipeline.extract import extract_text, sidecar_path, write_sidecar
 
-_SOFFICE = shutil.which("soffice") or (
-    "/Applications/LibreOffice.app/Contents/MacOS/soffice"
-    if Path("/Applications/LibreOffice.app/Contents/MacOS/soffice").exists()
-    else None
-)
+_SOFFICE = convert.find_soffice() is not None
 
 _CONTENT_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content
@@ -160,7 +156,7 @@ def test_an_image_only_pdf_yields_little_or_no_text_without_raising(image_only_p
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(_SOFFICE is None, reason="LibreOffice not installed")
+@pytest.mark.skipif(not _SOFFICE, reason="LibreOffice not installed")
 def test_a_pdf_with_real_text_round_trips(tmp_path):
     odp = tmp_path / "deck.odp"
     _write_fixture_odp(odp, ["Neutrino oscillation results"])
@@ -171,7 +167,7 @@ def test_a_pdf_with_real_text_round_trips(tmp_path):
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(_SOFFICE is None, reason="LibreOffice not installed")
+@pytest.mark.skipif(not _SOFFICE, reason="LibreOffice not installed")
 def test_multi_page_text_is_returned_in_page_order(tmp_path):
     odp = tmp_path / "deck.odp"
     _write_fixture_odp(odp, ["ALPHA MARKER PAGE ONE", "BETA MARKER PAGE TWO"])
@@ -183,7 +179,7 @@ def test_multi_page_text_is_returned_in_page_order(tmp_path):
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(_SOFFICE is None, reason="LibreOffice not installed")
+@pytest.mark.skipif(not _SOFFICE, reason="LibreOffice not installed")
 def test_write_sidecar_character_count_matches_for_a_real_document(tmp_path):
     odp = tmp_path / "deck.odp"
     _write_fixture_odp(odp, ["ALPHA MARKER PAGE ONE", "BETA MARKER PAGE TWO"])
@@ -193,3 +189,19 @@ def test_write_sidecar_character_count_matches_for_a_real_document(tmp_path):
 
     assert length > 0
     assert length == len(path.read_text())
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _SOFFICE, reason="LibreOffice not installed")
+def test_write_sidecar_reports_a_character_count_not_a_byte_count(tmp_path):
+    non_ascii = "café αβγ 日本語"
+    odp = tmp_path / "deck.odp"
+    _write_fixture_odp(odp, [non_ascii])
+
+    pdf = _convert_to_pdf(odp)
+    text = extract_text(pdf)
+    path, length = write_sidecar(pdf)
+
+    assert path.read_text(encoding="utf-8") == text
+    assert length == len(text)
+    assert length != len(path.read_bytes())
