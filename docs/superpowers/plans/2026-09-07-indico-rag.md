@@ -2464,12 +2464,22 @@ _RUNS = re.compile(r"-{2,}")
 
 
 def sanitize(text: str, *, max_length: int = 80) -> str:
-    """Make one path component out of arbitrary text, preserving legal unicode."""
+    """Make one path component out of arbitrary text, preserving legal unicode.
+
+    `max_length` bounds both the character count and the UTF-8 encoded byte
+    count of the result. A character-only cap is not enough: 80 characters of
+    CJK or other multi-byte text can still encode to well over 255 bytes,
+    which is the component-length limit most filesystems enforce.
+    """
     normalized = unicodedata.normalize("NFC", text).strip()
     cleaned = _ILLEGAL.sub("-", normalized)
     cleaned = _SEPARATORS.sub("-", cleaned)
     cleaned = _RUNS.sub("-", cleaned).strip("-. ")
-    return cleaned[:max_length].strip("-. ") or "untitled"
+    cleaned = cleaned[:max_length].strip("-. ")
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) > max_length:
+        cleaned = encoded[:max_length].decode("utf-8", errors="ignore").strip("-. ")
+    return cleaned or "untitled"
 
 
 def speaker_component(talk: Talk) -> str:
@@ -2498,13 +2508,20 @@ def destination(root: Path, event: Event, day: Day, session: Session, talk: Talk
 
 
 def deduplicate(path: Path, taken: set[Path]) -> Path:
-    """Return `path`, or the first free `<stem>-<n>` variant when it is already taken."""
-    if path not in taken:
+    """Return `path`, or the first free `<stem>-<n>` variant when it is already taken.
+
+    Comparison folds case. On a case-insensitive filesystem two names differing
+    only in case are one file, so treating them as distinct would let one talk
+    silently overwrite another; folding case also makes the output identical on
+    every platform.
+    """
+    claimed = {str(existing).casefold() for existing in taken}
+    if str(path).casefold() not in claimed:
         return path
     counter = 2
     while True:
         candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
-        if candidate not in taken:
+        if str(candidate).casefold() not in claimed:
             return candidate
         counter += 1
 ```
