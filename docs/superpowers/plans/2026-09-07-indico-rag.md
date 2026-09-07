@@ -1832,14 +1832,27 @@ def load_config(root: Path | None = None) -> Config:
     )
 
 
+_TOML_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _toml_string(value: str) -> str:
+    """Render value as a quoted TOML basic string, escaping backslashes and quotes.
+
+    A path containing a backslash or a quote would otherwise produce invalid
+    TOML, since backslash introduces an escape sequence in a basic string.
+    """
+    body = "".join(_TOML_ESCAPES.get(ch, ch) for ch in value)
+    return f'"{body}"'
+
+
 def save_config(config: Config, root: Path | None = None) -> None:
     path = config_root(root) / "config.toml"
     path.write_text(
-        f'output_root = "{config.output_root}"\n'
+        f"output_root = {_toml_string(str(config.output_root))}\n"
         f"download_concurrency = {config.download_concurrency}\n"
         f"convert_concurrency = {config.convert_concurrency}\n"
         f"extract_text = {str(config.extract_text).lower()}\n"
-        f'default_host = "{config.default_host}"\n'
+        f"default_host = {_toml_string(config.default_host)}\n"
     )
 
 
@@ -2002,12 +2015,23 @@ def get_token(host: str, root: Path | None = None) -> str | None:
     return _read_json(state_root(root) / "credentials.json").get(_host_key(host))
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write text to a file no one but its owner can read.
+
+    The mode is supplied to open(2) so the file is never created readable and
+    then narrowed; chmod additionally covers a file that already exists.
+    """
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(text)
+    os.chmod(path, 0o600)
+
+
 def set_token(host: str, token: str, root: Path | None = None) -> None:
     path = state_root(root) / "credentials.json"
     data = _read_json(path)
     data[_host_key(host)] = token
-    path.write_text(json.dumps(data, indent=2))
-    os.chmod(path, 0o600)
+    _write_private(path, json.dumps(data, indent=2))
 
 
 def get_host_regime(host: str, root: Path | None = None) -> str | None:
