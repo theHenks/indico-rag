@@ -43,6 +43,7 @@ class Summary:
     no_material: int = 0
     skipped: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
+    extraction_failures: list[tuple[str, str]] = field(default_factory=list)
 
 
 def build_jobs(event: Event, selected: set[str], root: Path) -> tuple[list[Job], list[Talk]]:
@@ -70,7 +71,8 @@ def build_jobs(event: Event, selected: set[str], root: Path) -> tuple[list[Job],
 
 def _record(job: Job, *, status: str, local_path: Path | None = None, sha: str | None = None,
             size: int | None = None, converted: bool = False,
-            conversion_error: str | None = None, text_path: str | None = None,
+            conversion_error: str | None = None, extraction_error: str | None = None,
+            text_path: str | None = None,
             text_chars: int | None = None, error: str | None = None) -> TalkRecord:
     talk = job.talk
     return TalkRecord(
@@ -84,6 +86,7 @@ def _record(job: Job, *, status: str, local_path: Path | None = None, sha: str |
         source_filename=job.attachment.filename,
         local_path=str(local_path) if local_path else None, sha256=sha, bytes=size,
         converted=converted, conversion_error=conversion_error,
+        extraction_error=extraction_error,
         text_path=text_path, text_chars=text_chars, status=status, error=error,
     )
 
@@ -161,18 +164,24 @@ async def _process(job: Job, *, client: IndicoClient, external: httpx.AsyncClien
 
         text_path: str | None = None
         text_chars: int | None = None
+        extraction_error: str | None = None
         if config.extract_text:
             on_update(talk_id, "extracting", final.name)
             try:
                 sidecar, text_chars = write_sidecar(final)
                 text_path = str(sidecar)
             except Exception as exc:  # noqa: BLE001 - recorded, never suppressed
-                conversion_error = f"text extraction failed: {exc}"
+                extraction_error = f"text extraction failed: {exc}"
+                summary.extraction_failures.append((job.talk.title, extraction_error))
+                on_update(talk_id, "extracting", extraction_error)
 
+        # The PDF itself downloaded (and, if needed, converted) correctly, so
+        # the talk still counts as done: a missing sidecar must not make a
+        # resume refetch or reconvert a file that is already good.
         manifest.add(_record(
             job, status="done", local_path=final, sha=sha256_of(final),
             size=final.stat().st_size, converted=converted, conversion_error=conversion_error,
-            text_path=text_path, text_chars=text_chars,
+            extraction_error=extraction_error, text_path=text_path, text_chars=text_chars,
         ))
         summary.done += 1
         on_update(talk_id, "done", final.name)
@@ -225,13 +234,20 @@ async def run_jobs(event: Event, jobs: list[Job], no_material: list[Talk], *, co
     async with IndicoClient(event.host, token=token) as client, httpx.AsyncClient(
         follow_redirects=True, timeout=120
     ) as external:
-        async with asyncio.TaskGroup() as group:
-            for job in jobs:
-                group.create_task(_process(
-                    job, client=client, external=external, manifest=manifest, summary=summary,
-                    config=config, download_sem=download_sem, convert_sem=convert_sem,
-                    profiles=profiles, on_update=report,
-                ))
+        # A cancellation (Ctrl-C, or a caller cancelling this coroutine) propagates
+        # past the TaskGroup once every task has finished or been cancelled; the
+        # manifest must still be saved on that path or every talk already
+        # completed vanishes from the resume record along with the one that
+        # was interrupted.
+        try:
+            async with asyncio.TaskGroup() as group:
+                for job in jobs:
+                    group.create_task(_process(
+                        job, client=client, external=external, manifest=manifest,
+                        summary=summary, config=config, download_sem=download_sem,
+                        convert_sem=convert_sem, profiles=profiles, on_update=report,
+                    ))
+        finally:
+            manifest.save()
 
-    manifest.save()
     return summary

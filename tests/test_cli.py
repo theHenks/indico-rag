@@ -74,6 +74,49 @@ def test_fetch_downloads_scans_and_records_without_touching_a_live_host(
 
 
 @respx.mock
+def test_fetch_exits_non_zero_when_text_extraction_fails(tmp_path, monkeypatch, capsys):
+    """A run whose PDFs all downloaded fine but whose sidecars did not must
+    still tell a script driving this tool that --extract was not honoured."""
+    pdf = Attachment(id="a1", filename="a.pdf", kind="file", url=f"{HOST}/files/a.pdf")
+    talk = Talk(id="c1", contribution_id="1", title="A", start=datetime(2026, 8, 31, 9, 0),
+               end=None, speakers=["Maria Rossi"], session_title="Plenary",
+               attachments=[pdf], chosen=pdf)
+    single_talk_event = Event(
+        id="50058", host=HOST, title="Workshop", slug="workshop",
+        days=[Day(date=date(2026, 8, 31),
+                  sessions=[Session(id="s1", title="Plenary", slug="plenary", talks=[talk])])],
+    )
+
+    respx.get(f"{HOST}/").mock(return_value=httpx.Response(200, json={"results": {}}))
+    respx.get(f"{HOST}/files/a.pdf").mock(return_value=httpx.Response(200, content=b"%PDF-a"))
+
+    monkeypatch.setattr(
+        cli.store, "load_config",
+        lambda *a, **k: store.Config(output_root=tmp_path, download_concurrency=4,
+                                     convert_concurrency=1, extract_text=False),
+    )
+    monkeypatch.setattr(cli.store, "get_token", lambda host, *a, **k: None)
+    monkeypatch.setattr(cli.store, "save_scan", lambda *a, **k: None)
+
+    async def fake_scan_event(host, event_id, *, token=None, progress=None):
+        return single_talk_event
+
+    monkeypatch.setattr(cli, "scan_event", fake_scan_event)
+
+    def failing_sidecar(pdf_path):
+        raise ValueError("no text layer")
+
+    monkeypatch.setattr("indico_rag.pipeline.runner.write_sidecar", failing_sidecar)
+
+    exit_code = cli.main(["fetch", EVENT_URL, "-o", str(tmp_path), "--extract"])
+
+    out = capsys.readouterr().out
+    assert exit_code != 0, "an unmet --extract request must not exit 0"
+    assert "done=1 failed=0" in out
+    assert "text extraction failed" in out.lower()
+
+
+@respx.mock
 def test_fetch_reports_a_bad_event_reference_without_making_any_request(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli.store, "load_config",

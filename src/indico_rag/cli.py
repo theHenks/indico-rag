@@ -87,7 +87,11 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
           f"skipped={summary.skipped} no-material={summary.no_material}")
     for title, reason in summary.failures:
         print(f"  FAILED  {title}: {reason}")
-    return 1 if summary.failed else 0
+    if summary.extraction_failures:
+        print("\ntext extraction failed for (the PDF itself is fine):")
+        for title, reason in summary.extraction_failures:
+            print(f"  NO TEXT  {title}: {reason}")
+    return 1 if summary.failed or summary.extraction_failures else 0
 
 
 def main(argv: list[str] | None = None) -> int:

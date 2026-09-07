@@ -47,6 +47,9 @@ class TalkRecord:
     bytes: int | None
     converted: bool
     conversion_error: str | None
+    # kw_only so a default is possible here without forcing one on every field
+    # declared after it; every TalkRecord() call site already uses keywords.
+    extraction_error: str | None = field(default=None, kw_only=True)
     text_path: str | None
     text_chars: int | None
     status: str

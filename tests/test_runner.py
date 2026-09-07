@@ -4,6 +4,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 
 from indico_rag.model import Attachment, Day, Event, Session, Talk
@@ -275,3 +276,77 @@ async def test_talks_without_material_are_recorded_not_silently_dropped(tmp_path
     summary = await run_jobs(event, jobs, none, config=_config(tmp_path), root=tmp_path)
     assert summary.no_material == 1
     assert Manifest.load(tmp_path / "50058_workshop" / MANIFEST_NAME).get("1").status == "no_material"
+
+
+@respx.mock
+async def test_a_failed_text_extraction_keeps_status_done_and_is_reported_separately(
+    tmp_path, monkeypatch
+):
+    """The PDF downloaded fine; only its sidecar is missing. That must not be
+    confused with a download or conversion failure: the talk stays "done",
+    the reason is filed under extraction_error (not conversion_error), and
+    it is reported through its own summary bucket rather than `failures`."""
+    event = _event(("A", "a.pdf"))
+    _mock_root()
+    respx.get(f"{HOST}/files/a.pdf").mock(return_value=httpx.Response(200, content=b"%PDF-a"))
+
+    def failing_sidecar(pdf: Path) -> tuple[Path, int]:
+        raise ValueError("no text layer")
+
+    monkeypatch.setattr(runner, "write_sidecar", failing_sidecar)
+
+    config = Config(output_root=tmp_path, download_concurrency=4, convert_concurrency=2,
+                    extract_text=True)
+    jobs, none = build_jobs(event, {"1"}, tmp_path)
+    summary = await run_jobs(event, jobs, none, config=config, root=tmp_path)
+
+    assert summary.failed == 0
+    assert summary.done == 1
+    assert jobs[0].dest.exists(), "the PDF must stay on disk"
+    assert summary.extraction_failures == [("A", "text extraction failed: no text layer")]
+
+    record = Manifest.load(tmp_path / "50058_workshop" / MANIFEST_NAME).get("1")
+    assert record.status == "done"
+    assert record.conversion_error is None
+    assert record.extraction_error == "text extraction failed: no text layer"
+
+
+@respx.mock
+async def test_manifest_is_saved_when_the_run_is_cancelled_mid_flight(tmp_path):
+    """A hundred-file run takes minutes; Ctrl-C mid-run is ordinary. Cancelling
+    the run_jobs() coroutine after one talk has already completed must not
+    discard that talk's manifest record along with the interrupted one."""
+    event = _event(("Fast", "fast.pdf"), ("Slow", "slow.pdf"))
+    _mock_root()
+    respx.get(f"{HOST}/files/fast.pdf").mock(return_value=httpx.Response(200, content=b"%PDF-fast"))
+
+    started_slow = asyncio.Event()
+
+    async def slow_responder(request: httpx.Request) -> httpx.Response:
+        started_slow.set()
+        await asyncio.sleep(10)
+        return httpx.Response(200, content=b"%PDF-slow")  # pragma: no cover - never reached
+
+    respx.get(f"{HOST}/files/slow.pdf").mock(side_effect=slow_responder)
+
+    jobs, none = build_jobs(event, {"1", "2"}, tmp_path)
+    config = Config(output_root=tmp_path, download_concurrency=2, convert_concurrency=1,
+                    extract_text=False)
+
+    task = asyncio.create_task(run_jobs(event, jobs, none, config=config, root=tmp_path))
+    for _ in range(200):
+        if started_slow.is_set() and jobs[0].dest.exists():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("the fast download never completed before cancelling")
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    manifest = Manifest.load(tmp_path / "50058_workshop" / MANIFEST_NAME)
+    record = manifest.get("1")
+    assert record is not None and record.status == "done", (
+        "the already-finished talk must survive the cancellation"
+    )
