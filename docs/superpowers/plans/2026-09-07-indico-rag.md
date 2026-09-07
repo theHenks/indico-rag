@@ -1317,9 +1317,9 @@ def attachments_by_contribution(event_export: dict) -> dict[str, list[Attachment
             # export's own `id` is a friendly number that matches nothing.
             key = str(contribution.get("db_id") or contribution.get("id", ""))
             items: list[Attachment] = []
-            for folder in contribution.get("folders", []):
-                folder_title = folder.get("title", "")
-                for raw in folder.get("attachments", []):
+            for folder in contribution.get("folders") or []:
+                folder_title = folder.get("title") or ""
+                for raw in folder.get("attachments") or []:
                     items.append(_attachment(raw, folder_title))
             if items:
                 found[key] = items
@@ -1403,14 +1403,22 @@ def parse_timetable(timetable: dict, *, host: str, event_id: str, event_title: s
             elif kind == "Contribution":
                 loose.append(_talk(entry, _UNSCHEDULED, True, attachments))
 
-        ordered = sorted(sessions.values(), key=lambda s: (s.talks[0].start or datetime.min))
+        # Order talks first, then order sessions by their earliest talk: Indico's
+        # `entries` map has no guaranteed order, so a session's first-listed talk
+        # is not necessarily its earliest.
+        for session in sessions.values():
+            session.talks.sort(key=lambda t: (t.start or datetime.min))
+
+        ordered = sorted(
+            sessions.values(),
+            key=lambda s: min((t.start or datetime.min) for t in s.talks),
+        )
         if loose:
+            loose.sort(key=lambda t: (t.start or datetime.min))
             ordered.append(
                 Session(id=f"synthetic-{day_key}", title=_UNSCHEDULED,
                         slug=slugify(_UNSCHEDULED), talks=loose, synthetic=True)
             )
-        for session in ordered:
-            session.talks.sort(key=lambda t: (t.start or datetime.min))
 
         if ordered:
             event.days.append(Day(date=day_date, sessions=ordered))
