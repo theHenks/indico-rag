@@ -49,6 +49,18 @@ def test_parse_rejects_a_page_without_a_challenge():
         parse_challenge("<html><body>hello</body></html>")
 
 
+def test_parse_rejects_a_present_but_malformed_base_prefix_block():
+    page = (
+        '<script id="anubis_challenge" type="application/json">'
+        '{"rules": {"difficulty": 4}, '
+        '"challenge": {"id": "abc", "randomData": "deadbeef"}}</script>'
+        '<script id="anubis_base_prefix" type="application/json">'
+        "not valid json</script>"
+    )
+    with pytest.raises(ChallengeParseError):
+        parse_challenge(page)
+
+
 def test_solve_returns_a_digest_with_the_required_zero_prefix():
     digest, nonce = solve("abc123", 3)
     assert digest.startswith("000")

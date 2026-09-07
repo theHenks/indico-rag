@@ -27,6 +27,5 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
 asyncio_mode = "auto"
 markers = ["slow: requires LibreOffice or network"]
