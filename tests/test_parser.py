@@ -88,6 +88,60 @@ EXPORT = {
     ]
 }
 
+# The outer day dict lists the afternoon session ("s2") before the morning one
+# ("s1"), and s1's own entries list its 10:00 talk before its 09:00 talk.
+# Indico's JSON gives no ordering guarantee on either dict, so a correct parse
+# must not rely on dict-insertion order for either sessions or talks.
+UNORDERED = {
+    "results": {
+        "50058": {
+            "20260901": {
+                "s2": {
+                    "entryType": "Session",
+                    "id": "s2",
+                    "title": "Afternoon Session",
+                    "entries": {
+                        "c3": {
+                            "entryType": "Contribution",
+                            "id": "c3",
+                            "contributionId": "23",
+                            "title": "Afternoon Talk",
+                            "startDate": {"date": "2026-09-01", "time": "09:30:00"},
+                            "endDate": {"date": "2026-09-01", "time": "09:50:00"},
+                            "presenters": [],
+                        },
+                    },
+                },
+                "s1": {
+                    "entryType": "Session",
+                    "id": "s1",
+                    "title": "Morning Session",
+                    "entries": {
+                        "c2": {
+                            "entryType": "Contribution",
+                            "id": "c2",
+                            "contributionId": "12",
+                            "title": "Morning Talk Two",
+                            "startDate": {"date": "2026-09-01", "time": "10:00:00"},
+                            "endDate": {"date": "2026-09-01", "time": "10:20:00"},
+                            "presenters": [],
+                        },
+                        "c1": {
+                            "entryType": "Contribution",
+                            "id": "c1",
+                            "contributionId": "11",
+                            "title": "Morning Talk One",
+                            "startDate": {"date": "2026-09-01", "time": "09:00:00"},
+                            "endDate": {"date": "2026-09-01", "time": "09:20:00"},
+                            "presenters": [],
+                        },
+                    },
+                },
+            }
+        }
+    }
+}
+
 
 def test_breaks_are_dropped_and_sessions_are_preserved():
     event = parse_timetable(
@@ -184,3 +238,41 @@ def test_the_captured_event_parses_into_a_non_empty_agenda():
     assert any(a.size for t in talks for a in t.attachments), \
         "attachments carry no size: the export join failed"
     assert len(talks) == 100, f"expected 100 talks in the capture, got {len(talks)}"
+
+
+def test_sessions_and_talks_are_ordered_by_start_time_not_dict_order():
+    event = parse_timetable(
+        UNORDERED, host="https://agenda.infn.it", event_id="50058", event_title="Workshop"
+    )
+    day = event.days[0]
+    assert [s.title for s in day.sessions] == ["Morning Session", "Afternoon Session"]
+    morning = day.sessions[0]
+    assert [t.title for t in morning.talks] == ["Morning Talk One", "Morning Talk Two"]
+
+
+def test_attachments_by_contribution_tolerates_explicit_nulls():
+    # Indico emits explicit `null` in place of an empty list or string in
+    # several export payloads (see contribution 304612 in the captured
+    # fixture, whose "files" is null rather than []).
+    export = {
+        "results": [
+            {
+                "contributions": [
+                    {"db_id": 11, "folders": None},
+                    {"db_id": 12, "folders": [
+                        {"title": None, "attachments": None},
+                    ]},
+                    {"db_id": 13, "folders": [
+                        {"title": None, "attachments": [
+                            {"id": "1", "filename": "a.pdf",
+                             "download_url": "https://x/a.pdf", "type": "file"}
+                        ]},
+                    ]},
+                ]
+            }
+        ]
+    }
+    attachments = attachments_by_contribution(export)
+    assert "11" not in attachments
+    assert "12" not in attachments
+    assert attachments["13"][0].folder_title == ""
