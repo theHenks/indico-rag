@@ -22,7 +22,10 @@
 - No blanket `except Exception: pass`. Every failure is recorded in the manifest and in the closing summary.
 - Filtering changes what is displayed, never what is selected.
 - Credentials live in a `0600` file and are never written into a scan cache or a manifest.
-- Commits use `Assisted-by:`, not `Co-authored-by:`.
+- Commit trailers: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` followed by
+  `Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr`. This session's
+  system-level attribution directive supersedes the `Assisted-by:` convention in the
+  user's global instructions; the first two commits on `main` predate the resolution.
 - **Shell hazard on this machine:** `cat` is aliased to `bat` and `rm` to `trash`. Use `command cat`, `tee`, or a `python3` heredoc to write files, and `command rm` to delete. A bare `cat > file <<EOF` silently writes ANSI escapes into the file.
 
 ## File Structure
@@ -166,8 +169,12 @@ def main() -> int:
             payload = json.loads(m.group(1))
             print("challenge payload:", json.dumps(payload)[:400])
 
-            challenge = payload["challenge"]
-            difficulty = payload.get("rules", {}).get("difficulty", 4)
+            # `challenge` is an object; the hashed string is its randomData field,
+            # and pass-challenge rejects a submission that omits the challenge id.
+            block = payload["challenge"]
+            challenge = block["randomData"]
+            challenge_id = block["id"]
+            difficulty = payload.get("rules", {}).get("difficulty", block.get("difficulty", 4))
             pm = PREFIX_RE.search(r.text)
             prefix = json.loads(pm.group(1)) if pm else ""
 
@@ -180,6 +187,7 @@ def main() -> int:
             pr = client.get(
                 pass_url,
                 params={
+                    "id": challenge_id,
                     "response": digest,
                     "nonce": nonce,
                     "redir": url,
@@ -253,7 +261,8 @@ Fixtures are captured from agenda.infn.it event 50058 through the
 Anubis proof-of-work challenge and are the reference inputs for the
 challenge-parsing and timetable-parsing tests.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself**
@@ -278,7 +287,7 @@ Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `tests/fixtures/anubis_interstitial.html` from Task 1.
 - Produces:
   - `is_interstitial(text: str) -> bool`
-  - `@dataclass(frozen=True) AnubisChallenge` with fields `challenge: str`, `difficulty: int`, `base_prefix: str`
+  - `@dataclass(frozen=True) AnubisChallenge` with fields `challenge: str` (the hashed `randomData` string), `challenge_id: str`, `difficulty: int`, `base_prefix: str`
   - `parse_challenge(html: str) -> AnubisChallenge` — raises `ChallengeParseError`
   - `solve(challenge: str, difficulty: int, *, max_attempts: int = 50_000_000) -> tuple[str, int]` returning `(hex_digest, nonce)` — raises `ProofOfWorkTooHard`
   - `class ChallengeParseError(Exception)`, `class ProofOfWorkTooHard(Exception)`
@@ -318,8 +327,20 @@ def test_plain_json_is_not_an_interstitial():
 def test_parses_challenge_from_captured_page():
     ch = parse_challenge(INTERSTITIAL)
     assert isinstance(ch, AnubisChallenge)
-    assert len(ch.challenge) >= 16
+    # The hashed value is challenge.randomData, a long hex string - not the object.
+    assert len(ch.challenge) >= 32
+    assert all(c in "0123456789abcdef" for c in ch.challenge)
+    assert ch.challenge_id, "pass-challenge is rejected without the challenge id"
     assert ch.difficulty >= 1
+
+
+def test_parse_rejects_a_challenge_object_missing_random_data():
+    page = (
+        '<script id="anubis_challenge" type="application/json">'
+        '{"rules": {"difficulty": 4}, "challenge": {"id": "abc"}}</script>'
+    )
+    with pytest.raises(ChallengeParseError):
+        parse_challenge(page)
 
 
 def test_parse_rejects_a_page_without_a_challenge():
@@ -380,6 +401,7 @@ class ProofOfWorkTooHard(Exception):
 @dataclass(frozen=True)
 class AnubisChallenge:
     challenge: str
+    challenge_id: str
     difficulty: int
     base_prefix: str = ""
 
@@ -394,8 +416,14 @@ def parse_challenge(html: str) -> AnubisChallenge:
         raise ChallengeParseError("no anubis_challenge block in response body")
     try:
         payload = json.loads(match.group(1))
-        challenge = payload["challenge"]
-        difficulty = int(payload.get("rules", {}).get("difficulty", 4))
+        block = payload["challenge"]
+        # Anubis v1.25 nests the challenge: the hashed string is randomData, and
+        # the id must be echoed back or pass-challenge answers 500.
+        challenge = block["randomData"]
+        challenge_id = block["id"]
+        difficulty = int(
+            payload.get("rules", {}).get("difficulty", block.get("difficulty", 4))
+        )
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise ChallengeParseError(f"malformed anubis_challenge block: {exc}") from exc
 
@@ -407,11 +435,16 @@ def parse_challenge(html: str) -> AnubisChallenge:
         except json.JSONDecodeError:
             prefix = ""
 
-    return AnubisChallenge(challenge=challenge, difficulty=difficulty, base_prefix=prefix)
+    return AnubisChallenge(challenge=challenge, challenge_id=challenge_id,
+                           difficulty=difficulty, base_prefix=prefix)
 
 
 def solve(challenge: str, difficulty: int, *, max_attempts: int = 50_000_000) -> tuple[str, int]:
-    """Return (hex_digest, nonce) where sha256(challenge+nonce) has `difficulty` leading zeros."""
+    """Return (hex_digest, nonce) where sha256(challenge+nonce) has `difficulty` leading zeros.
+
+    `difficulty` counts leading zero hex characters: the client's own progress
+    maths uses 16**-difficulty, so difficulty 5 means five zero nibbles.
+    """
     target = "0" * difficulty
     for nonce in range(max_attempts):
         digest = hashlib.sha256(f"{challenge}{nonce}".encode()).hexdigest()
@@ -437,7 +470,8 @@ Detection keys on the response body because Anubis serves its
 interstitial with status 200. The solver has an attempt ceiling so a
 raised difficulty aborts the run instead of spinning.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -706,8 +740,10 @@ class IndicoClient:
         return written
 
     async def _ensure_prepared(self, url: str) -> None:
+        # Detect on the host root, never on `url`: probing the file URL would
+        # fetch the file once here and again in the stream below.
         if self.regime is None:
-            await self._request("GET", url)
+            await self._request("GET", "/")
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         response = await self._client.request(method, path, **kwargs)
@@ -747,6 +783,7 @@ class IndicoClient:
             await self._client.get(
                 f"{challenge.base_prefix}/.within.website/x/cmd/anubis/api/pass-challenge",
                 params={
+                    "id": challenge.challenge_id,
                     "response": digest,
                     "nonce": nonce,
                     "redir": str(response.url),
@@ -771,7 +808,8 @@ with status 200 is not mistaken for success. Concurrent requests share
 one cookie jar and re-solve a mid-run challenge under a lock so only one
 coroutine performs the work.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -1275,7 +1313,8 @@ confined to the parser. Breaks are dropped and contributions outside any
 session are gathered into a synthetic session, so the tree and the
 output layout always have that level.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -1464,7 +1503,8 @@ Ranks by format, then upload time, then folder and filename wording, so
 a talk's chosen file is known before any download starts. Attachments in
 formats no converter handles are never chosen.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -1849,7 +1889,8 @@ Scans persist the parsed agenda alongside the last selection and output
 directory so reopening one restores both. Tokens live in an owner-only
 file and are never written into a scan.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2103,7 +2144,8 @@ Scanning fetches the timetable and attachment metadata, applies the
 ranking rule, and caches the result, so the chosen file for every talk
 is visible before anything is downloaded.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself — milestone 1: the agenda, end to end**
@@ -2297,7 +2339,8 @@ Names carry start time, first speaker's surname and title, capped in
 length and stripped of characters the filesystem rejects. Two talks
 sharing a time and speaker are separated by a numeric suffix.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2581,7 +2624,8 @@ without converting. Every conversion runs under a timeout followed by a
 kill, and a run that produces no PDF raises rather than leaving an empty
 file behind.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2707,7 +2751,8 @@ Writes one text sidecar per talk using pypdfium2. An image-only deck
 yields little text; that is recorded as a character count rather than
 treated as a failure.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2922,7 +2967,8 @@ the checksum that decides whether a re-run can skip the talk. Only a
 completed record whose file is still present and unchanged counts as
 complete, so failures are retried.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -3445,7 +3491,8 @@ never waits on the converter. Failures are isolated per talk and land in
 both the manifest and the closing summary; a failed conversion keeps the
 original file.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself — milestone 2: real downloads, no interface yet**
@@ -3876,7 +3923,8 @@ accumulates across successive filters instead of replacing the previous
 choice. An unparseable regular expression raises rather than falling
 back to substring matching, which would silently show a different set.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -4218,7 +4266,8 @@ file each talk would produce. Selecting every shown talk accumulates
 across filters, and an unparseable regular expression is reported in the
 status line instead of silently matching something else.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -4493,7 +4542,8 @@ selection; the new-event screen accepts a pasted URL or a bare id and
 reports each scan stage, so the seconds spent on a proof of work do not
 look like a hang.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -4693,7 +4743,8 @@ A bare indico-rag now opens the home screen, and the four screens pass
 an event from scan through selection to download. The closing summary
 lists every failure with its reason.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself — milestone 3: the whole tool**
@@ -4744,7 +4795,8 @@ uv run pytest -v
 git add -A
 git commit -m "Add README and MIT licence
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 - [ ] **Step 5: Create the remote and push**
