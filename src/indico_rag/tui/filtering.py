@@ -79,10 +79,9 @@ def visible_talks(event: Event, spec: FilterSpec) -> list[Talk]:
 def facets(event: Event) -> dict[str, list]:
     """The distinct values available to the structured filters."""
     days = [day.date for day in event.days]
-    # Not deduplicated by title: a parallel session that spans several days
-    # is split into one Session per day, all sharing the same title, and
-    # each split counts as its own facet entry.
-    sessions = [s.title for day in event.days for s in day.sessions]
+    # Deduplicated by title: the session filter selects by title, so one
+    # facet entry already covers every session slot that shares it.
+    sessions = {s.title for day in event.days for s in day.sessions}
     tracks = {t.track for t in event.all_talks() if t.track}
     types = {t.contribution_type for t in event.all_talks() if t.contribution_type}
     return {

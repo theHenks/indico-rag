@@ -173,6 +173,8 @@ def test_the_captured_event_matches_measured_ground_truth():
     talks = event.all_talks()
     assert len(talks) == 100
     assert len(event.days) == 5
+    # A model property: the agenda has 14 physical Session objects. Four
+    # parallel sessions are each split across two days and so appear twice.
     assert sum(len(day.sessions) for day in event.days) == 14
 
     counts = Counter(material_state(t) for t in talks)
@@ -180,6 +182,15 @@ def test_the_captured_event_matches_measured_ground_truth():
 
     found = facets(event)
     assert len(found["days"]) == 5
-    assert len(found["sessions"]) == 14
+    # A menu property: the session filter matches by title, so the two
+    # day-slots of each split parallel session collapse to one facet entry.
+    assert len(found["sessions"]) == 10
     assert found["tracks"] == []
     assert found["types"] == []
+
+    # One facet entry must still cover every session slot sharing its title:
+    # this title spans two day-slots (9 talks each), so both are returned.
+    split_title = "Session I (parallel) - Standard three-neutrino oscillations"
+    assert split_title in found["sessions"]
+    spec = FilterSpec(sessions={split_title})
+    assert len(visible_talks(event, spec)) == 18
