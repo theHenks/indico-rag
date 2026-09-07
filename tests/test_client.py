@@ -156,6 +156,60 @@ async def test_stream_to_writes_a_payload_larger_than_one_chunk(tmp_path):
 
 
 @respx.mock
+async def test_stream_to_succeeds_when_the_homepage_carries_a_login_link(tmp_path):
+    # The regression this whole fix is about: a normal homepage's nav links to
+    # /login/, which must not make _ensure_prepared's root probe raise
+    # AuthRequired for every host.
+    pdf_bytes = b"%PDF-1.4 fake pdf content"
+    respx.get(f"{HOST}/").mock(
+        return_value=httpx.Response(
+            200,
+            html=(
+                f'<html><body><nav><a href="{HOST}/login/">Login</a></nav>'
+                "<h1>Welcome</h1></body></html>"
+            ),
+        )
+    )
+    respx.get(f"{HOST}/files/paper.pdf").mock(
+        return_value=httpx.Response(
+            200, content=pdf_bytes, headers={"content-type": "application/pdf"}
+        )
+    )
+
+    dest = tmp_path / "paper.pdf"
+    async with IndicoClient(HOST) as client:
+        written = await client.stream_to("/files/paper.pdf", dest)
+
+    assert written == len(pdf_bytes)
+    assert dest.read_bytes() == pdf_bytes
+    assert client.regime is Regime.OPEN
+
+
+@respx.mock
+async def test_stream_to_raises_when_the_file_url_redirects_to_login(tmp_path):
+    # A per-file permission gate a host-root probe cannot see: the host is
+    # OPEN, but this specific attachment redirects to a login page. Two real
+    # mocked hops (not a hand-built `history=`) so httpx follows the redirect
+    # itself and populates `response.history` the way it would live.
+    respx.get(f"{HOST}/").mock(return_value=httpx.Response(200, json={"results": {}}))
+    respx.get(f"{HOST}/files/secret.pdf").mock(
+        return_value=httpx.Response(
+            302, headers={"location": f"{HOST}/login/?next=/files/secret.pdf"}
+        )
+    )
+    respx.get(f"{HOST}/login/", params={"next": "/files/secret.pdf"}).mock(
+        return_value=httpx.Response(200, html="<html>please log in</html>")
+    )
+
+    dest = tmp_path / "secret.pdf"
+    async with IndicoClient(HOST) as client:
+        with pytest.raises(AuthRequired):
+            await client.stream_to("/files/secret.pdf", dest)
+
+    assert not dest.exists() or dest.stat().st_size == 0
+
+
+@respx.mock
 async def test_stream_to_handles_an_empty_body(tmp_path):
     respx.get(f"{HOST}/").mock(return_value=httpx.Response(200, json={"results": {}}))
     respx.get(f"{HOST}/files/empty.pdf").mock(

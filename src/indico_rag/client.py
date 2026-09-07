@@ -9,7 +9,13 @@ from types import TracebackType
 import httpx
 
 from indico_rag.access import anubis
-from indico_rag.access.base import AuthRequired, Regime, classify, looks_like_login
+from indico_rag.access.base import (
+    AuthRequired,
+    Regime,
+    classify,
+    looks_like_login,
+    redirected_through_login,
+)
 from indico_rag.access.token import apply_token
 
 USER_AGENT = "indico-rag/0.1 (+https://github.com/theHenks/indico-rag)"
@@ -65,13 +71,17 @@ class IndicoClient:
         return written
 
     async def _stream_checked(self, url: str, dest: Path) -> int | None:
-        """Stream `url` into `dest`, or return None if the body is a challenge page.
+        """Stream `url` into `dest`, or return None if it is a login or challenge page.
 
-        Only HTML bodies are inspected: an attachment may legitimately be an HTML
-        file, and a real one carries none of Anubis's markers.
+        A redirect through a login page is checked regardless of content type.
+        Otherwise, only HTML bodies are inspected: an attachment may legitimately
+        be an HTML file, and a real one carries none of Anubis's markers.
         """
         async with self._client.stream("GET", url) as response:
             response.raise_for_status()
+            if redirected_through_login(response):
+                return None
+
             chunks = response.aiter_bytes(chunk_size=65536)
             try:
                 first = await anext(chunks)

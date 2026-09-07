@@ -5,12 +5,15 @@ every HTTP call `run_jobs` makes goes through respx.
 """
 from __future__ import annotations
 
+import stat
 from datetime import date, datetime
+from pathlib import Path
 
 import httpx
 import respx
 
 from indico_rag import cli, store
+from indico_rag.access.base import AuthRequired
 from indico_rag.model import Attachment, Day, Event, Session, Talk
 
 HOST = "https://agenda.infn.it"
@@ -125,3 +128,97 @@ def test_fetch_reports_a_bad_event_reference_without_making_any_request(tmp_path
     )
     exit_code = cli.main(["fetch", "not-a-url"])
     assert exit_code == 2
+
+
+@respx.mock
+def test_scan_token_flag_stores_and_sends_a_bearer_header(tmp_path, monkeypatch, capsys):
+    stored = []
+    monkeypatch.setattr(
+        cli.store, "load_config",
+        lambda *a, **k: store.Config(output_root=tmp_path, download_concurrency=4,
+                                     convert_concurrency=1, extract_text=False),
+    )
+    monkeypatch.setattr(cli.store, "save_scan", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli.store, "set_token",
+        lambda host, token, *a, **k: stored.append((host, token)),
+    )
+
+    respx.get(f"{HOST}/").mock(return_value=httpx.Response(200, json={"results": {}}))
+    timetable_route = respx.get(f"{HOST}/export/timetable/50058.json").mock(
+        return_value=httpx.Response(200, json={"results": {}})
+    )
+    respx.get(f"{HOST}/export/event/50058.json").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+
+    exit_code = cli.main(["scan", EVENT_URL, "--token", "secret-token"])
+
+    assert exit_code == 0
+    assert stored == [(HOST, "secret-token")]
+    assert timetable_route.calls.last.request.headers["authorization"] == "Bearer secret-token"
+
+
+def test_auth_required_with_no_stored_token_names_the_tokens_url_and_login_command(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        cli.store, "load_config",
+        lambda *a, **k: store.Config(output_root=tmp_path, download_concurrency=4,
+                                     convert_concurrency=1, extract_text=False),
+    )
+    monkeypatch.setattr(cli.store, "get_token", lambda host, *a, **k: None)
+
+    async def raising_scan_event(host, event_id, *, token=None, progress=None):
+        raise AuthRequired(host)
+
+    monkeypatch.setattr(cli, "scan_event", raising_scan_event)
+
+    exit_code = cli.main(["fetch", EVENT_URL, "-o", str(tmp_path)])
+
+    err = capsys.readouterr().err
+    assert exit_code == 3
+    assert f"{HOST}/user/tokens/" in err
+    assert "indico-rag login" in err
+
+
+def test_login_stores_a_token_for_a_bare_host(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli.store, "set_token",
+        lambda host, token, *a, **k: calls.append((host, token)),
+    )
+    monkeypatch.setattr(cli.store, "state_root", lambda *a, **k: Path("/fake/state/root"))
+
+    exit_code = cli.main(["login", HOST, "--token", "indp_abc"])
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert calls == [(HOST, "indp_abc")]
+    assert HOST in out
+    assert "credentials.json" in out
+
+
+def test_login_accepts_an_event_url_and_extracts_its_host(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli.store, "set_token",
+        lambda host, token, *a, **k: calls.append((host, token)),
+    )
+    monkeypatch.setattr(cli.store, "state_root", lambda *a, **k: Path("/fake/state/root"))
+
+    exit_code = cli.main(["login", EVENT_URL, "--token", "indp_abc"])
+
+    assert exit_code == 0
+    assert calls == [(HOST, "indp_abc")]
+
+
+def test_login_writes_credentials_file_with_owner_only_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.store, "state_root", lambda *a, **k: tmp_path)
+
+    exit_code = cli.main(["login", HOST, "--token", "indp_abc"])
+
+    assert exit_code == 0
+    path = tmp_path / "credentials.json"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert store.get_token(HOST, root=tmp_path) == "indp_abc"
