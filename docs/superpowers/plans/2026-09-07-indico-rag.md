@@ -27,6 +27,7 @@
   system-level attribution directive supersedes the `Assisted-by:` convention in the
   user's global instructions; the first two commits on `main` predate the resolution.
 - **Shell hazard on this machine:** `cat` is aliased to `bat` and `rm` to `trash`. Use `command cat`, `tee`, or a `python3` heredoc to write files, and `command rm` to delete. A bare `cat > file <<EOF` silently writes ANSI escapes into the file.
+- Commit messages: write the message to a file with the Write tool, then `git commit -F <path>`. A local hook protects `.git/`, so write it under the session scratchpad rather than `.git/COMMIT_MSG`.
 
 ## File Structure
 
@@ -1558,7 +1559,7 @@ every row and an override is a single field reassignment.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from indico_rag.model import Attachment, Event, Talk
 
@@ -1591,18 +1592,31 @@ def _format_rank(attachment: Attachment) -> int | None:
     return FORMAT_ORDER.get(attachment.suffix)
 
 
+def _upload_key(uploaded: datetime | None) -> tuple[int, float]:
+    """Sort key for upload recency; a missing upload time sorts last.
+
+    Attachment.uploaded is timezone-aware for real Indico data but may be naive
+    in synthetic data; a naive value is read as UTC so the two are never
+    compared directly. datetime.min is unusable as a sentinel here because
+    datetime.min.timestamp() raises.
+    """
+    if uploaded is None:
+        return (1, 0.0)
+    aware = uploaded if uploaded.tzinfo is not None else uploaded.replace(tzinfo=timezone.utc)
+    return (0, -aware.timestamp())
+
+
 def rank(attachment: Attachment) -> tuple:
     """Sort key; lower is better. Only call on attachments with a usable format."""
     format_rank = _format_rank(attachment)
     assert format_rank is not None
-    uploaded = attachment.uploaded or datetime.min
     text = f"{attachment.folder_title} {attachment.filename}"
     name_rank = 1
     if _PREFERRED.search(text):
         name_rank = 0
     if _DEPRIORITIZED.search(text):
         name_rank = 2
-    return (format_rank, -uploaded.timestamp(), name_rank, attachment.filename)
+    return (format_rank, _upload_key(attachment.uploaded), name_rank, attachment.filename)
 
 
 def choose(talk: Talk) -> Attachment | None:
