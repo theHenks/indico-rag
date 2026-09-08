@@ -33,6 +33,28 @@ async def test_scan_returns_a_ranked_event_and_reports_progress():
                any(a.suffix in {"pdf", "pptx", "ppt", "odp", "key"} for a in t.attachments))
 
 
+@respx.mock
+async def test_scan_event_surfaces_a_scope_warning_from_the_client():
+    timetable = json.loads((FIXTURES / "timetable_50058.json").read_text())
+    export = json.loads((FIXTURES / "event_50058_contributions.json").read_text())
+
+    def timetable_responder(request: httpx.Request) -> httpx.Response:
+        if "authorization" in request.headers:
+            return httpx.Response(400, json={"error": "insufficient_scope"})
+        return httpx.Response(200, json=timetable)
+
+    respx.get(f"{HOST}/export/timetable/50058.json").mock(side_effect=timetable_responder)
+    respx.get(f"{HOST}/export/event/50058.json").mock(
+        return_value=httpx.Response(200, json=export)
+    )
+
+    stages: list[str] = []
+    event = await scan_event(HOST, "50058", token="indp_badscope", progress=stages.append)
+
+    assert event.days
+    assert any("Classic API" in s for s in stages)
+
+
 def test_format_agenda_shows_days_sessions_and_chosen_files():
     from datetime import date, datetime
 

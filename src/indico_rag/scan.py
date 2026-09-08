@@ -21,6 +21,8 @@ async def scan_event(host: str, event_id: str, *, token: str | None = None,
     async with IndicoClient(host, token=token) as client:
         report("fetching timetable")
         timetable = await client.get_json(timetable_path(event_id))
+        if client.warning is not None:
+            report(client.warning)
         report(f"access regime: {client.regime}")
 
         report("fetching attachments")

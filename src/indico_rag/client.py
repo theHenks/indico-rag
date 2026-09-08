@@ -12,6 +12,7 @@ from indico_rag.access import anubis
 from indico_rag.access.base import (
     AuthRequired,
     Regime,
+    UnexpectedResponse,
     classify,
     looks_like_login,
     redirected_through_login,
@@ -41,6 +42,7 @@ class IndicoClient:
         apply_token(self._client, token)
         self._solve_lock = asyncio.Lock()
         self._last_solved_at: float | None = None
+        self.warning: str | None = None
 
     async def __aenter__(self) -> "IndicoClient":
         return self
@@ -51,7 +53,25 @@ class IndicoClient:
 
     async def get_json(self, path: str, params: dict | None = None) -> dict:
         response = await self._request("GET", path, params=params)
+        if response.status_code >= 400 or "json" not in response.headers.get("content-type", ""):
+            raise UnexpectedResponse(path, response)
         return response.json()
+
+    def _drop_token(self) -> None:
+        """Stop sending the token, recording why the first time.
+
+        A token the host rejects for lack of scope must not leave the tool less
+        capable than sending none at all: anonymous access is a supported mode
+        and reaches all public material. The warning names the missing scope so
+        the token can be corrected rather than silently tolerated.
+        """
+        self._client.headers.pop("Authorization", None)
+        if self.warning is None:
+            self.warning = (
+                f"the stored token for {self.host} lacks the Classic API (read only) "
+                f"scope and is being ignored; add that scope at "
+                f"{self.host}/user/tokens/ to use it"
+            )
 
     async def stream_to(self, url: str, dest: Path) -> int:
         """Stream a URL into `dest`, returning the number of bytes written."""
@@ -113,22 +133,33 @@ class IndicoClient:
         issued_at = time.monotonic()
         response = await self._client.request(method, path, **kwargs)
         regime = classify(response)
-        self.regime = regime
-
-        if regime is Regime.AUTH_REQUIRED:
-            raise AuthRequired(self.host)
 
         if regime is Regime.PROOF_OF_WORK:
             await self._solve(response, issued_at)
             response = await self._client.request(method, path, **kwargs)
             regime = classify(response)
-            if regime is Regime.AUTH_REQUIRED:
-                raise AuthRequired(self.host)
             if regime is Regime.PROOF_OF_WORK:
                 raise anubis.ChallengeParseError(
                     f"{self.host} still challenges after a solved proof of work"
                 )
             self.regime = Regime.PROOF_OF_WORK
+        else:
+            self.regime = regime
+
+        # A scope rejection reaches the client either immediately or only once
+        # the challenge is out of the way, so it is judged on the settled
+        # response rather than on the first one.
+        if regime is Regime.INSUFFICIENT_SCOPE:
+            if "Authorization" not in self._client.headers:
+                raise AuthRequired(self.host, "the token's scope is too narrow")
+            self._drop_token()
+            response = await self._client.request(method, path, **kwargs)
+            regime = classify(response)
+            if regime is Regime.INSUFFICIENT_SCOPE:
+                raise AuthRequired(self.host, "the token's scope is too narrow")
+
+        if regime is Regime.AUTH_REQUIRED:
+            raise AuthRequired(self.host)
 
         return response
 

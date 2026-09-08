@@ -15,16 +15,38 @@ class Regime(StrEnum):
     OPEN = "open"
     PROOF_OF_WORK = "proof_of_work"
     AUTH_REQUIRED = "auth_required"
+    INSUFFICIENT_SCOPE = "insufficient_scope"
+
+
+class UnexpectedResponse(Exception):
+    """The server answered with something the caller cannot interpret.
+
+    Carries the status, the content type and an excerpt of the body so the
+    cause is legible without a stack trace through a JSON decoder.
+    """
+
+    def __init__(self, url: str, response: httpx.Response) -> None:
+        excerpt = " ".join(response.text[:200].split())
+        content_type = response.headers.get("content-type", "unknown")
+        super().__init__(
+            f"{url} answered {response.status_code} with {content_type}, "
+            f"not the JSON expected: {excerpt}"
+        )
+        self.status_code = response.status_code
+        self.content_type = content_type
 
 
 class AuthRequired(Exception):
     """The host needs an Indico API token that is absent or was rejected."""
 
-    def __init__(self, host: str) -> None:
+    def __init__(self, host: str, reason: str = "") -> None:
+        detail = f" ({reason})" if reason else ""
         super().__init__(
-            f"{host} requires authentication; create a token at {host}/user/tokens/"
+            f"{host} requires authentication{detail}; create a token at "
+            f"{host}/user/tokens/ with the Classic API (read only) scope"
         )
         self.host = host
+        self.reason = reason
 
 
 def looks_like_login(text: str) -> bool:
@@ -59,9 +81,25 @@ def redirected_through_login(response: httpx.Response) -> bool:
     return any(_has_login_segment(url) for url in urls)
 
 
+def has_insufficient_scope(response: httpx.Response) -> bool:
+    """Report whether `response` is an OAuth rejection for a too-narrow token scope.
+
+    Indico answers a token that authenticates but lacks the scope for the
+    requested endpoint with 400 and an `insufficient_scope` OAuth error, not
+    with 401 or 403. The marker is checked rather than the status alone, so an
+    unrelated 400 is not mistaken for a credential problem.
+    """
+    if response.status_code != 400:
+        return False
+    return "insufficient_scope" in response.text
+
+
 def classify(response: httpx.Response) -> Regime:
     if response.status_code in (401, 403):
         return Regime.AUTH_REQUIRED
+
+    if has_insufficient_scope(response):
+        return Regime.INSUFFICIENT_SCOPE
 
     if redirected_through_login(response):
         return Regime.AUTH_REQUIRED

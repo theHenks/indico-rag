@@ -64,6 +64,28 @@ def test_login_form_body_without_a_redirect_is_open():
     assert classify(r) is Regime.OPEN
 
 
+def test_400_with_insufficient_scope_body_is_insufficient_scope():
+    r = _response(
+        400,
+        '{"error": "insufficient_scope", "error_description": '
+        '"The request requires higher privileges than provided by the access token"}',
+        {"content-type": "application/json"},
+    )
+    assert classify(r) is Regime.INSUFFICIENT_SCOPE
+
+
+def test_400_json_content_type_with_scope_marker_is_not_swallowed_as_open():
+    # A 400 with a JSON body would otherwise fall into the json-content-type
+    # shortcut below and read as OPEN; the scope marker must be checked first.
+    r = _response(400, '{"error": "insufficient_scope"}', {"content-type": "application/json"})
+    assert classify(r) is Regime.INSUFFICIENT_SCOPE
+
+
+def test_400_without_scope_marker_is_not_insufficient_scope():
+    r = _response(400, "<html>Bad Request</html>", {"content-type": "text/html"})
+    assert classify(r) is not Regime.INSUFFICIENT_SCOPE
+
+
 def test_redirect_history_through_login_is_auth_required_even_off_host():
     # CERN's OIDC shape: /user/dashboard/ -> /login/?next=... -> /login/cern-oidc/
     # -> auth.cern.ch/... . The final URL carries no /login segment at all;

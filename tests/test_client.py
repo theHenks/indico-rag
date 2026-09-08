@@ -1,9 +1,11 @@
+import json
+
 import httpx
 import pytest
 import respx
 
 from indico_rag.access import anubis
-from indico_rag.access.base import AuthRequired, Regime
+from indico_rag.access.base import AuthRequired, Regime, UnexpectedResponse
 from indico_rag.client import IndicoClient
 
 HOST = "https://indico.example.org"
@@ -44,6 +46,76 @@ async def test_auth_required_raises_naming_the_host():
         with pytest.raises(AuthRequired) as excinfo:
             await client.get_json("/export/timetable/1.json")
     assert excinfo.value.host == HOST
+
+
+@respx.mock
+async def test_get_json_raises_unexpected_response_for_a_non_json_error_body():
+    respx.get(f"{HOST}/export/timetable/1.json").mock(
+        return_value=httpx.Response(400, html="<html>Bad Request</html>")
+    )
+    async with IndicoClient(HOST) as client:
+        with pytest.raises(UnexpectedResponse) as excinfo:
+            await client.get_json("/export/timetable/1.json")
+    assert not isinstance(excinfo.value, json.JSONDecodeError)
+    assert "400" in str(excinfo.value)
+    assert "Bad Request" in str(excinfo.value)
+
+
+@respx.mock
+async def test_insufficient_scope_token_falls_back_to_anonymous_and_warns():
+    calls = {"with_auth": 0, "without_auth": 0}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if "authorization" in request.headers:
+            calls["with_auth"] += 1
+            return httpx.Response(
+                400,
+                json={
+                    "error": "insufficient_scope",
+                    "error_description": (
+                        "The request requires higher privileges than provided "
+                        "by the access token"
+                    ),
+                },
+            )
+        calls["without_auth"] += 1
+        return httpx.Response(200, json={"results": {"ok": True}})
+
+    respx.get(f"{HOST}/export/timetable/1.json").mock(side_effect=responder)
+
+    async with IndicoClient(HOST, token="indp_badscope") as client:
+        data = await client.get_json("/export/timetable/1.json")
+
+    assert data == {"results": {"ok": True}}
+    # Exactly one anonymous retry per request, never a repeated fallback loop.
+    assert calls == {"with_auth": 1, "without_auth": 1}
+    assert client.warning is not None
+    assert "Classic API" in client.warning
+    assert f"{HOST}/user/tokens/" in client.warning
+
+
+@respx.mock
+async def test_non_scope_400_raises_unexpected_response_without_stripping_the_token():
+    route = respx.get(f"{HOST}/export/timetable/1.json").mock(
+        return_value=httpx.Response(400, json={"error": "bad_request"})
+    )
+    async with IndicoClient(HOST, token="indp_x") as client:
+        with pytest.raises(UnexpectedResponse):
+            await client.get_json("/export/timetable/1.json")
+    assert route.call_count == 1
+    assert route.calls.last.request.headers["authorization"] == "Bearer indp_x"
+
+
+@respx.mock
+async def test_insufficient_scope_when_anonymous_retry_also_fails_raises_auth_required():
+    respx.get(f"{HOST}/export/timetable/1.json").mock(
+        return_value=httpx.Response(400, json={"error": "insufficient_scope"})
+    )
+    async with IndicoClient(HOST, token="indp_badscope") as client:
+        with pytest.raises(AuthRequired) as excinfo:
+            await client.get_json("/export/timetable/1.json")
+    assert f"{HOST}/user/tokens/" in str(excinfo.value)
+    assert "scope" in str(excinfo.value).lower()
 
 
 @respx.mock
