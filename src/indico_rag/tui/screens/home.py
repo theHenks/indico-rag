@@ -56,6 +56,14 @@ class HomeScreen(Screen):
         table.add_columns("scanned", "event", "talks", "dates", "title")
         self.reload()
 
+    def on_screen_resume(self) -> None:
+        """Re-read the scans whenever this screen comes back to the front.
+
+        A scan made while this screen was buried would otherwise be absent from
+        the list until the application is restarted.
+        """
+        self.reload()
+
     def reload(self) -> None:
         self.records = store.list_scans(self.state_root)
         table = self.query_one("#scans", DataTable)

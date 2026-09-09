@@ -211,3 +211,30 @@ async def test_a_first_visit_offers_to_store_a_token(tmp_path, monkeypatch):
     assert store.get_token("https://indico.example.org", tmp_path) == "indp_secret"
     assert seen["token"] == "indp_secret", "the entered token must be used for the scan"
     assert store.is_known_host("https://indico.example.org", tmp_path)
+
+
+async def test_a_scan_made_while_the_home_screen_was_buried_appears_on_return(tmp_path):
+    """The list is re-read on the way back, not only when first opened.
+
+    A scan is saved while the home screen sits underneath another, so a list
+    built once at mount would stay empty until the application restarts.
+    """
+    from indico_rag.tui.screens.select import SelectScreen
+
+    app = IndicoRagApp(state_root=tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        home = app.screen
+        assert isinstance(home, HomeScreen)
+        assert home.records == []
+
+        await app.push_screen(SelectScreen(_event(), tmp_path))
+        await pilot.pause()
+        store.save_scan(_event(), root=tmp_path)
+
+        await pilot.press("h")
+        await pilot.pause()
+        await pilot.pause()
+
+        assert isinstance(app.screen, HomeScreen)
+        assert [record.event_id for record in app.screen.records] == ["50058"]

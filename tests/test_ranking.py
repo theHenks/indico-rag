@@ -121,3 +121,21 @@ def test_ranking_the_captured_event_picks_a_usable_file_for_nearly_every_talk():
     # no attachments in either source and is the only talk left unchosen.
     assert len(chosen_pdf) == 97
     assert len(needs_conversion) == 2
+
+
+def test_a_google_doc_is_not_treated_as_slides():
+    """Only a presentation is material for a talk.
+
+    A Google Doc attached to a session is a shared notes or questions page, not
+    the speaker's slides, and exporting it would put an unrelated document into
+    the downloaded set.
+    """
+    doc = Attachment(id="l", filename="Questions", kind="link",
+                     url="https://docs.google.com/document/d/ABC123/edit?tab=t.0")
+    assert is_google_slides(doc.url) is False
+    assert choose(_talk(doc)) is None
+
+    sheet = Attachment(id="l2", filename="Rota", kind="link",
+                       url="https://docs.google.com/spreadsheets/d/XYZ/edit")
+    assert is_google_slides(sheet.url) is False
+    assert choose(_talk(sheet)) is None
