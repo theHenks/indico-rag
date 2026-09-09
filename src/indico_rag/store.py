@@ -257,6 +257,20 @@ def _write_private(path: Path, text: str) -> None:
     os.chmod(path, 0o600)
 
 
+def is_known_host(host: str, root: Path | None = None) -> bool:
+    """Report whether this host has been used before.
+
+    A host counts as known once it holds a token or has produced a scan, which
+    is what distinguishes a first visit worth asking about from a return one.
+    """
+    key = _host_key(host)
+    if key in _read_json(state_root(root) / "credentials.json"):
+        return True
+    if key in _read_json(state_root(root) / "hosts.json"):
+        return True
+    return any(_host_key(record.host) == key for record in list_scans(root))
+
+
 def get_token(host: str, root: Path | None = None) -> str | None:
     return _read_json(state_root(root) / "credentials.json").get(_host_key(host))
 

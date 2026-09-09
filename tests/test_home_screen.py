@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date, datetime
 
 from textual.coordinate import Coordinate
@@ -7,9 +8,12 @@ from textual.widgets._data_table import default_cell_formatter
 from indico_rag.access.base import AuthRequired
 from indico_rag.model import Day, Event, Session, Talk
 from indico_rag.store import load_scan, save_scan
+from textual.widgets import Input
+
+from indico_rag import store
 from indico_rag.tui.app import IndicoRagApp
 from indico_rag.tui.screens.home import HomeScreen
-from indico_rag.tui.screens.new_event import NewEventScreen
+from indico_rag.tui.screens.new_event import NewEventScreen, TokenPrompt
 
 
 def _event(event_id="50058", title="LNGS Workshop") -> Event:
@@ -145,14 +149,65 @@ async def test_new_event_screen_surfaces_auth_required_with_its_token_url(tmp_pa
 
     monkeypatch.setattr("indico_rag.tui.screens.new_event.scan_event", fake_scan_event)
 
+    # Already-seen host, so the first-visit token prompt does not intervene.
+    store.set_host_regime("https://indico.example.org", "anonymous", tmp_path)
+
     app = IndicoRagApp(state_root=tmp_path)
     async with app.run_test() as pilot:
         screen = NewEventScreen(state_root=tmp_path)
         await app.push_screen(screen)
         await pilot.pause()
 
-        await screen._scan("https://indico.example.org/event/123/")
-        await pilot.pause()
+        # Driven through the input rather than by calling the worker body: the
+        # screen offers to store a token, which needs a worker context.
+        screen.query_one("#url", Input).value = "https://indico.example.org/event/123/"
+        await pilot.press("enter")
+        for _ in range(40):
+            await pilot.pause()
+            log = screen.query_one("#progress")
+            if any("user/tokens/" in line for line in log.lines):
+                break
+            await asyncio.sleep(0.02)
 
         log = screen.query_one("#progress")
         assert any("https://indico.example.org/user/tokens/" in line for line in log.lines)
+
+
+async def test_a_first_visit_offers_to_store_a_token(tmp_path, monkeypatch):
+    """An unknown host is asked about once, and an entered token is kept."""
+    seen = {}
+
+    async def fake_scan_event(host, event_id, *, token=None, progress=None):
+        seen["token"] = token
+        return _event()
+
+    monkeypatch.setattr("indico_rag.tui.screens.new_event.scan_event", fake_scan_event)
+
+    app = IndicoRagApp(state_root=tmp_path)
+    async with app.run_test() as pilot:
+        screen = NewEventScreen(state_root=tmp_path)
+        await app.push_screen(screen)
+        await pilot.pause()
+
+        assert not store.is_known_host("https://indico.example.org", tmp_path)
+
+        screen.query_one("#url", Input).value = "https://indico.example.org/event/123/"
+        await pilot.press("enter")
+        for _ in range(40):
+            await pilot.pause()
+            if isinstance(app.screen, TokenPrompt):
+                break
+            await asyncio.sleep(0.02)
+        assert isinstance(app.screen, TokenPrompt), type(app.screen).__name__
+
+        app.screen.query_one("#token", Input).value = "indp_secret"
+        await pilot.press("enter")
+        for _ in range(40):
+            await pilot.pause()
+            if seen:
+                break
+            await asyncio.sleep(0.02)
+
+    assert store.get_token("https://indico.example.org", tmp_path) == "indp_secret"
+    assert seen["token"] == "indp_secret", "the entered token must be used for the scan"
+    assert store.is_known_host("https://indico.example.org", tmp_path)
