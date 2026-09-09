@@ -10,6 +10,7 @@ from indico_rag import store
 from indico_rag.access.base import AuthRequired
 from indico_rag.indico.endpoints import parse_event_ref
 from indico_rag.scan import format_agenda, scan_event
+from indico_rag.tui.app import IndicoRagApp
 
 
 def _resolve_token(host: str, cli_token: str | None) -> str | None:
@@ -145,10 +146,18 @@ def _cmd_fetch(args: argparse.Namespace) -> int:
     return 1 if summary.failed or summary.extraction_failures else 0
 
 
+def _cmd_tui(_: argparse.Namespace) -> int:
+    from indico_rag.tui.app import IndicoRagApp
+
+    IndicoRagApp().run()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="indico-rag",
                                      description="Download an Indico event's talks as PDFs.")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
+    parser.set_defaults(func=_cmd_tui)
 
     scan_parser = sub.add_parser("scan", help="fetch an event agenda and print it")
     scan_parser.add_argument("event", help="event URL or bare event id")
