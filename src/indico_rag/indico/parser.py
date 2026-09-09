@@ -47,7 +47,13 @@ def _person_name(person: dict) -> str:
 
 def _attachment(raw: dict, folder_title: str) -> Attachment:
     kind = "link" if raw.get("type") == "link" or raw.get("link_url") else "file"
-    url = raw.get("download_url") or raw.get("link_url") or raw.get("url") or ""
+    if kind == "link":
+        # A link attachment carries both its target and an Indico redirect that
+        # stands in front of it; the target is what says where the material
+        # really lives and whether it can be fetched.
+        url = raw.get("link_url") or raw.get("download_url") or raw.get("url") or ""
+    else:
+        url = raw.get("download_url") or raw.get("url") or ""
     filename = raw.get("filename") or raw.get("title") or url.rsplit("/", 1)[-1] or "attachment"
     modified = raw.get("modified_dt")
     uploaded = None

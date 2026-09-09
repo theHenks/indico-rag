@@ -328,3 +328,39 @@ def test_two_slots_of_one_session_in_a_day_keep_all_their_talks():
     # Both slots belong to one session, so they share a folder rather than
     # producing two identically named ones.
     assert len(event.days[0].sessions) == 1
+
+
+def test_a_link_attachment_keeps_its_target_not_the_redirect():
+    """A link attachment must carry where the material really is.
+
+    Indico exposes both the destination and a redirect of its own standing in
+    front of it. Keeping the redirect hides what the link points at, so a
+    Google Slides deck cannot be recognised or exported and the talk reads as
+    having no material.
+    """
+    export = {"results": [{"contributions": [
+        {"db_id": 11, "folders": [{"title": "Slides", "attachments": [
+            {"id": "1", "title": "Deck", "type": "link",
+             "download_url": "https://indico.example.org/event/1/attachments/5/8/go",
+             "link_url": "https://docs.google.com/presentation/d/ABC123/edit"}
+        ]}]}
+    ]}]}
+
+    attachment = attachments_by_contribution(export)["11"][0]
+    assert attachment.kind == "link"
+    assert attachment.url == "https://docs.google.com/presentation/d/ABC123/edit"
+
+
+def test_a_google_slides_link_is_chosen_and_exported_as_pdf():
+    from indico_rag.indico.ranking import choose, google_slides_pdf_url
+    from indico_rag.model import Attachment, Talk
+
+    link = Attachment(id="l", filename="Deck", kind="link",
+                      url="https://docs.google.com/presentation/d/ABC123/edit")
+    talk = Talk(id="c1", contribution_id="1", title="T", start=None, end=None,
+                attachments=[link])
+    chosen = choose(talk)
+    assert chosen is link, "a Google Slides link is usable material"
+    assert google_slides_pdf_url(chosen.url) == (
+        "https://docs.google.com/presentation/d/ABC123/export/pdf"
+    )
