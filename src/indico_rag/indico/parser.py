@@ -159,7 +159,16 @@ def parse_timetable(timetable: dict, *, host: str, event_id: str, event_title: s
                         continue
                     session.talks.append(_talk(child, title, False, attachments))
                 if session.talks:
-                    sessions[session.id or session.slug] = session
+                    # A session can hold several slots in one day, a morning
+                    # and an afternoon block sharing one session id. Their
+                    # talks belong together under that session rather than one
+                    # slot replacing the other and taking its talks with it.
+                    key = session.id or session.slug
+                    existing = sessions.get(key)
+                    if existing is None:
+                        sessions[key] = session
+                    else:
+                        existing.talks.extend(session.talks)
             elif kind == "Contribution":
                 loose.append(_talk(entry, _UNSCHEDULED, True, attachments))
 

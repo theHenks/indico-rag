@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from indico_rag.access.base import AuthRequired
 from indico_rag.client import IndicoClient
 from indico_rag.indico.endpoints import contributions_path, timetable_path
 from indico_rag.indico.parser import attachments_by_contribution, parse_timetable
@@ -35,7 +36,25 @@ async def scan_event(host: str, event_id: str, *, token: str | None = None,
     event = parse_timetable(timetable, host=host, event_id=event_id, event_title=title,
                             attachments=attachments)
     apply_ranking(event)
-    report(f"parsed {len(event.all_talks())} talks across {len(event.days)} days")
+
+    talks = event.all_talks()
+    if event.days and not talks:
+        # A restricted instance answers an unauthenticated client with a
+        # structurally valid timetable whose days are empty, rather than
+        # refusing outright, so an empty agenda has to be treated as a refusal.
+        raise AuthRequired(
+            host,
+            f"the timetable lists {len(event.days)} days but no talks, "
+            "which usually means the event is restricted",
+        )
+
+    if talks and not attachments:
+        report(
+            "no attachment metadata was returned for this event: material may be "
+            "restricted, and talks will show as having none"
+        )
+
+    report(f"parsed {len(talks)} talks across {len(event.days)} days")
     return event
 
 

@@ -276,3 +276,55 @@ def test_attachments_by_contribution_tolerates_explicit_nulls():
     assert "11" not in attachments
     assert "12" not in attachments
     assert attachments["13"][0].folder_title == ""
+
+
+def test_two_slots_of_one_session_in_a_day_keep_all_their_talks():
+    """A session split into two blocks in one day must not lose a block.
+
+    Indico gives each slot its own timetable entry while both carry the same
+    session id, so keying sessions by that id and assigning discards whichever
+    slot is parsed first, silently halving the day.
+    """
+    timetable = {
+        "results": {
+            "9": {
+                "20260301": {
+                    "s-morning": {
+                        "entryType": "Session",
+                        "id": "s-morning",
+                        "sessionId": 42,
+                        "title": "Hardware",
+                        "entries": {
+                            "c1": {
+                                "entryType": "Contribution", "id": "c1",
+                                "contributionId": "1", "title": "Morning talk",
+                                "startDate": {"date": "2026-03-01", "time": "09:00:00"},
+                                "endDate": {"date": "2026-03-01", "time": "09:30:00"},
+                            }
+                        },
+                    },
+                    "s-afternoon": {
+                        "entryType": "Session",
+                        "id": "s-afternoon",
+                        "sessionId": 42,
+                        "title": "Hardware",
+                        "entries": {
+                            "c2": {
+                                "entryType": "Contribution", "id": "c2",
+                                "contributionId": "2", "title": "Afternoon talk",
+                                "startDate": {"date": "2026-03-01", "time": "14:00:00"},
+                                "endDate": {"date": "2026-03-01", "time": "14:30:00"},
+                            }
+                        },
+                    },
+                }
+            }
+        }
+    }
+
+    event = parse_timetable(timetable, host="https://x", event_id="9", event_title="E")
+    titles = [talk.title for talk in event.all_talks()]
+    assert titles == ["Morning talk", "Afternoon talk"], titles
+    # Both slots belong to one session, so they share a folder rather than
+    # producing two identically named ones.
+    assert len(event.days[0].sessions) == 1
