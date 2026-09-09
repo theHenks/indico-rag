@@ -40,16 +40,41 @@ class FilterSpec:
 
 
 def _matcher(spec: FilterSpec):
+    """Build the test applied to a talk's searchable fields.
+
+    A leading "!" excludes instead of selecting. Exclusion is judged over all
+    of a talk's fields at once rather than one at a time: a talk is hidden when
+    the pattern appears anywhere about it, so "!parallel" drops a talk whose
+    session is parallel even though its title and speaker do not say so.
+    """
     if not spec.text:
-        return lambda _: True
+        return lambda fields: True
+
+    text, negated = spec.text, False
+    if text.startswith("!"):
+        text, negated = text[1:], True
+        if not text:
+            return lambda fields: True
+
     if spec.regex:
         try:
-            pattern = re.compile(spec.text, re.I)
+            pattern = re.compile(text, re.I)
         except re.error as exc:
             raise InvalidPattern(str(exc)) from exc
-        return lambda haystack: pattern.search(haystack) is not None
-    needle = spec.text.lower()
-    return lambda haystack: needle in haystack.lower()
+
+        def hits(field: str) -> bool:
+            return pattern.search(field) is not None
+    else:
+        needle = text.lower()
+
+        def hits(field: str) -> bool:
+            return needle in field.lower()
+
+    def matcher(fields: list[str]) -> bool:
+        found = any(hits(field) for field in fields)
+        return not found if negated else found
+
+    return matcher
 
 
 def visible_talks(event: Event, spec: FilterSpec) -> list[Talk]:
@@ -70,8 +95,9 @@ def visible_talks(event: Event, spec: FilterSpec) -> list[Talk]:
                     continue
                 if spec.material and material_state(talk) not in spec.material:
                     continue
-                fields = [talk.title, *talk.speakers, session.title]
-                if any(matches(f) for f in fields):
+                # The session name is searched too, and it is the same string
+                # that names the folder a talk is written into.
+                if matches([talk.title, *talk.speakers, session.title]):
                     found.append(talk)
     return found
 

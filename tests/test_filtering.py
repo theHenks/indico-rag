@@ -194,3 +194,47 @@ def test_the_captured_event_matches_measured_ground_truth():
     assert split_title in found["sessions"]
     spec = FilterSpec(sessions={split_title})
     assert len(visible_talks(event, spec)) == 18
+
+
+def test_a_leading_bang_excludes_matching_talks():
+    """Selecting a track is a search; skipping one needs the inverse.
+
+    "Everything except the parallel sessions" cannot be phrased positively, so
+    the pattern is negated instead.
+    """
+    event = _event()
+    everything = visible_talks(event, FilterSpec())
+    parallel = visible_talks(event, FilterSpec(text="plenary"))
+    excluded = visible_talks(event, FilterSpec(text="!plenary"))
+
+    assert len(parallel) + len(excluded) == len(everything)
+    matched = {talk.contribution_id for talk in parallel}
+    assert not matched & {talk.contribution_id for talk in excluded}
+
+
+def test_exclusion_hides_a_talk_matched_only_by_its_session():
+    """Exclusion is judged over the whole talk, not field by field.
+
+    A talk whose title and speaker never say "Plenary" still belongs to a
+    plenary session, so excluding that word must drop it; testing each field
+    separately would keep it because its title does not match.
+    """
+    event = _event()
+    session_titles = {s.title for day in event.days for s in day.sessions}
+    assert "Plenary" in session_titles
+
+    kept = visible_talks(event, FilterSpec(text="!Plenary"))
+    assert all(talk.session_title != "Plenary" for talk in kept), (
+        [t.title for t in kept]
+    )
+
+
+def test_a_bare_bang_shows_everything():
+    event = _event()
+    assert len(visible_talks(event, FilterSpec(text="!"))) == len(event.all_talks())
+
+
+def test_exclusion_works_in_regex_mode():
+    event = _event()
+    kept = visible_talks(event, FilterSpec(text="!^Neutrino", regex=True))
+    assert all(not t.title.startswith("Neutrino") for t in kept)

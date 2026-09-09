@@ -87,7 +87,10 @@ class SelectScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
-            yield Input(placeholder="filter (ctrl+r for regex)", id="filter")
+            yield Input(
+                placeholder="filter title, speaker or session — ! to exclude, ctrl+r for regex",
+                id="filter",
+            )
         yield AgendaTree("agenda", id="agenda")
         yield Static(id="status")
         yield Footer()
