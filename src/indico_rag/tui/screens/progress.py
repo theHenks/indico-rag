@@ -7,7 +7,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
 from rich.text import Text
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import DataTable, Footer, Header, ProgressBar, Static
 from textual.widgets.data_table import ColumnKey, RowKey
 
 from indico_rag.model import Event
@@ -35,6 +35,7 @@ class ProgressScreen(Screen):
     BINDINGS = [
         Binding("escape", "leave", "back"),
         Binding("q", "leave", "back"),
+        Binding("h", "home", "main menu"),
     ]
 
     def __init__(self, event: Event, selected: set[str], output_root: Path, config: Config,
@@ -52,6 +53,7 @@ class ProgressScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield ProgressBar(total=max(1, len(self.selected)), show_eta=True, id="bar")
         yield DataTable(id="rows")
         yield Static(id="summary")
         yield Footer()
@@ -65,6 +67,12 @@ class ProgressScreen(Screen):
         self._finished = 0
         self._render_counts()
         self.run_worker(self._run(), exclusive=True)
+
+    def action_home(self) -> None:
+        """Return to the list of scans, stopping the run if it is still going."""
+        if self.summary is None:
+            self.workers.cancel_all()
+        self.app.action_home()
 
     def action_leave(self) -> None:
         """Return to the previous screen, stopping the run if it is still going."""
@@ -96,6 +104,7 @@ class ProgressScreen(Screen):
 
         if stage in ("done", "failed", "skipped"):
             self._finished += 1
+            self.query_one("#bar", ProgressBar).advance(1)
             self._render_counts()
 
     async def _run(self) -> None:

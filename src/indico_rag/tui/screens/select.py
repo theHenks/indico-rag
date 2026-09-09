@@ -66,6 +66,7 @@ class SelectScreen(Screen):
         Binding("o", "override", "override file"),
         Binding("d", "change_output", "output dir"),
         Binding("D", "start", "download"),
+        Binding("h", "home", "main menu"),
     ]
 
     class Start(Message):
@@ -208,6 +209,9 @@ class SelectScreen(Screen):
         if path is not None:
             self.output_root = path
             self.refresh_tree()
+
+    def action_home(self) -> None:
+        self.app.action_home()
 
     def action_start(self) -> None:
         self.post_message(self.Start(set(self.state.selected), self.output_root))

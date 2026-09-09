@@ -41,6 +41,11 @@ class IndicoRagApp(App):
     def on_mount(self) -> None:
         self.push_screen(HomeScreen(self.state_root))
 
+    def action_home(self) -> None:
+        """Drop back to the list of scans, leaving whatever is stacked above it."""
+        while len(self.screen_stack) > 1 and not isinstance(self.screen, HomeScreen):
+            self.pop_screen()
+
     def on_home_screen_new_scan(self, _: HomeScreen.NewScan) -> None:
         self.push_screen(NewEventScreen(self.state_root, self.config.default_host))
 

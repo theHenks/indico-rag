@@ -63,6 +63,44 @@ async def test_a_download_run_fills_the_table_and_reaches_a_summary(tmp_path):
     assert len(list(out.rglob("*.pdf"))) == 3
 
 
+@respx.mock
+async def test_the_bar_tracks_completion_and_h_returns_to_the_scan_list(tmp_path):
+    """The bar must reach full, and there must be a way back out.
+
+    A run that finishes leaves the screen with nothing else to do, so being
+    unable to leave it strands the whole application.
+    """
+    from textual.widgets import ProgressBar
+
+    from indico_rag.tui.screens.home import HomeScreen
+
+    respx.get(f"{_HOST}/").mock(return_value=httpx.Response(200, json={}))
+    for index in range(3):
+        respx.get(f"{_HOST}/f/{index}.pdf").mock(return_value=httpx.Response(
+            200, content=b"%PDF-1.4 x", headers={"content-type": "application/pdf"}
+        ))
+
+    out = tmp_path / "out"
+    app = IndicoRagApp(state_root=tmp_path / "state")
+    async with app.run_test() as pilot:
+        screen = ProgressScreen(_event(), {"0", "1", "2"}, out,
+                                Config(output_root=out, download_concurrency=2,
+                                       convert_concurrency=1, extract_text=False))
+        await app.push_screen(screen)
+        for _ in range(60):
+            await pilot.pause()
+            if screen.summary is not None:
+                break
+            await asyncio.sleep(0.05)
+
+        bar = screen.query_one("#bar", ProgressBar)
+        assert bar.progress == bar.total, f"bar stopped at {bar.progress}/{bar.total}"
+
+        await pilot.press("h")
+        await pilot.pause()
+        assert isinstance(app.screen, HomeScreen), type(app.screen).__name__
+
+
 """Progress screen for the indico-rag TUI."""
 
 from indico_rag.pipeline.runner import Summary
