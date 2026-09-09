@@ -3,14 +3,46 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from importlib.metadata import PackageNotFoundError, version
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import DataTable, Footer, Header, Markdown, Static
 
 from indico_rag import store
+
+_LOGO = r"""
+ _           _ _                                
+(_)_ __   __| (_) ___ ___         _ __ __ _  __ _
+| | '_ \ / _` | |/ __/ _ \ _____ | '__/ _` |/ _` |
+| | | | | (_| | | (_| (_) |_____|| | | (_| | (_| |
+|_|_| |_|\__,_|_|\___\___/       |_|  \__,_|\__, |
+                                             |___/
+"""
+
+
+def _version() -> str:
+    try:
+        return version("indico-rag")
+    except PackageNotFoundError:  # running from a source tree without an install
+        return "unreleased"
+
+
+def _readme() -> str:
+    """The project's README, shown as the standing help on this screen.
+
+    Searched for by walking up from this module rather than by a fixed depth,
+    so it is found whether the package is run from a source tree or installed.
+    """
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "README.md"
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    return "# indico-rag\n\nPress `n` to scan an event."
 
 
 class HomeScreen(Screen):
@@ -47,8 +79,11 @@ class HomeScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static(Text(_LOGO.strip("\n"), style="bold"), id="logo")
+        yield Static(f"version {_version()}  ·  press n to scan an event", id="status")
         yield DataTable(id="scans", cursor_type="row")
-        yield Static("press n for a new event", id="status")
+        with VerticalScroll(id="help"):
+            yield Markdown(_readme())
         yield Footer()
 
     def on_mount(self) -> None:

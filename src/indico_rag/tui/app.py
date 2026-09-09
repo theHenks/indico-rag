@@ -17,7 +17,15 @@ from indico_rag.tui.screens.select import SelectScreen
 class IndicoRagApp(App):
     """Root application: hosts the home, new-event and selection screens."""
 
-    CSS = ""
+    CSS = """
+    #logo { color: $accent; height: auto; padding: 0 1; }
+    #status { color: $text-muted; height: 1; padding: 0 1; }
+    /* The table takes only the room its rows need, so the help below it is
+       readable when there are few scans and it still cannot crowd the help
+       out when there are many. */
+    #scans { height: auto; max-height: 40%; }
+    #help { height: 1fr; border-top: solid $panel; padding: 0 1; }
+    """
     TITLE = "indico-rag"
     BINDINGS = [Binding("ctrl+q", "quit", "quit", priority=True)]
 

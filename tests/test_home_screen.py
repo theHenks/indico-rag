@@ -8,6 +8,7 @@ from textual.widgets._data_table import default_cell_formatter
 from indico_rag.access.base import AuthRequired
 from indico_rag.model import Day, Event, Session, Talk
 from indico_rag.store import load_scan, save_scan
+from textual.containers import VerticalScroll
 from textual.widgets import Input
 
 from indico_rag import store
@@ -238,3 +239,36 @@ async def test_a_scan_made_while_the_home_screen_was_buried_appears_on_return(tm
 
         assert isinstance(app.screen, HomeScreen)
         assert [record.event_id for record in app.screen.records] == ["50058"]
+
+
+def test_the_help_pane_shows_the_real_readme():
+    """The standing help is the project's own README, not a stub.
+
+    It is found by walking up from the module rather than by a fixed depth, so
+    a wrong assumption about the layout shows as a placeholder rather than an
+    error. Asserting on its content is what catches that.
+    """
+    from indico_rag.tui.screens.home import _readme
+
+    text = _readme()
+    assert text.startswith("# indico-rag")
+    assert "Choosing talks" in text, "the README fell back to the placeholder"
+    assert len(text) > 2000
+
+
+async def test_the_home_screen_shows_a_logo_and_a_version(tmp_path):
+    from textual.widgets import Markdown, Static
+
+    app = IndicoRagApp(state_root=tmp_path)
+    async with app.run_test(size=(100, 46)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        home = app.screen
+        assert home.query_one("#logo", Static) is not None
+        assert home.query_one("#help", VerticalScroll).query_one(Markdown) is not None
+        status = home.query_one("#status", Static)
+        rendered = "".join(
+            segment.text for strip in status.render_lines(status.size.region)
+            for segment in strip
+        )
+        assert "version" in rendered, rendered
