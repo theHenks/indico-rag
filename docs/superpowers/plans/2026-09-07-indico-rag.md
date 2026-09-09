@@ -22,8 +22,12 @@
 - No blanket `except Exception: pass`. Every failure is recorded in the manifest and in the closing summary.
 - Filtering changes what is displayed, never what is selected.
 - Credentials live in a `0600` file and are never written into a scan cache or a manifest.
-- Commits use `Assisted-by:`, not `Co-authored-by:`.
+- Commit trailers: `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>` followed by
+  `Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr`. This session's
+  system-level attribution directive supersedes the `Assisted-by:` convention in the
+  user's global instructions; the first two commits on `main` predate the resolution.
 - **Shell hazard on this machine:** `cat` is aliased to `bat` and `rm` to `trash`. Use `command cat`, `tee`, or a `python3` heredoc to write files, and `command rm` to delete. A bare `cat > file <<EOF` silently writes ANSI escapes into the file.
+- Commit messages: write the message to a file with the Write tool, then `git commit -F <path>`. A local hook protects `.git/`, so write it under the session scratchpad rather than `.git/COMMIT_MSG`.
 
 ## File Structure
 
@@ -166,8 +170,12 @@ def main() -> int:
             payload = json.loads(m.group(1))
             print("challenge payload:", json.dumps(payload)[:400])
 
-            challenge = payload["challenge"]
-            difficulty = payload.get("rules", {}).get("difficulty", 4)
+            # `challenge` is an object; the hashed string is its randomData field,
+            # and pass-challenge rejects a submission that omits the challenge id.
+            block = payload["challenge"]
+            challenge = block["randomData"]
+            challenge_id = block["id"]
+            difficulty = payload.get("rules", {}).get("difficulty", block.get("difficulty", 4))
             pm = PREFIX_RE.search(r.text)
             prefix = json.loads(pm.group(1)) if pm else ""
 
@@ -180,6 +188,7 @@ def main() -> int:
             pr = client.get(
                 pass_url,
                 params={
+                    "id": challenge_id,
                     "response": digest,
                     "nonce": nonce,
                     "redir": url,
@@ -253,7 +262,8 @@ Fixtures are captured from agenda.infn.it event 50058 through the
 Anubis proof-of-work challenge and are the reference inputs for the
 challenge-parsing and timetable-parsing tests.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself**
@@ -278,7 +288,7 @@ Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: `tests/fixtures/anubis_interstitial.html` from Task 1.
 - Produces:
   - `is_interstitial(text: str) -> bool`
-  - `@dataclass(frozen=True) AnubisChallenge` with fields `challenge: str`, `difficulty: int`, `base_prefix: str`
+  - `@dataclass(frozen=True) AnubisChallenge` with fields `challenge: str` (the hashed `randomData` string), `challenge_id: str`, `difficulty: int`, `base_prefix: str`
   - `parse_challenge(html: str) -> AnubisChallenge` — raises `ChallengeParseError`
   - `solve(challenge: str, difficulty: int, *, max_attempts: int = 50_000_000) -> tuple[str, int]` returning `(hex_digest, nonce)` — raises `ProofOfWorkTooHard`
   - `class ChallengeParseError(Exception)`, `class ProofOfWorkTooHard(Exception)`
@@ -318,8 +328,20 @@ def test_plain_json_is_not_an_interstitial():
 def test_parses_challenge_from_captured_page():
     ch = parse_challenge(INTERSTITIAL)
     assert isinstance(ch, AnubisChallenge)
-    assert len(ch.challenge) >= 16
+    # The hashed value is challenge.randomData, a long hex string - not the object.
+    assert len(ch.challenge) >= 32
+    assert all(c in "0123456789abcdef" for c in ch.challenge)
+    assert ch.challenge_id, "pass-challenge is rejected without the challenge id"
     assert ch.difficulty >= 1
+
+
+def test_parse_rejects_a_challenge_object_missing_random_data():
+    page = (
+        '<script id="anubis_challenge" type="application/json">'
+        '{"rules": {"difficulty": 4}, "challenge": {"id": "abc"}}</script>'
+    )
+    with pytest.raises(ChallengeParseError):
+        parse_challenge(page)
 
 
 def test_parse_rejects_a_page_without_a_challenge():
@@ -380,6 +402,7 @@ class ProofOfWorkTooHard(Exception):
 @dataclass(frozen=True)
 class AnubisChallenge:
     challenge: str
+    challenge_id: str
     difficulty: int
     base_prefix: str = ""
 
@@ -394,24 +417,37 @@ def parse_challenge(html: str) -> AnubisChallenge:
         raise ChallengeParseError("no anubis_challenge block in response body")
     try:
         payload = json.loads(match.group(1))
-        challenge = payload["challenge"]
-        difficulty = int(payload.get("rules", {}).get("difficulty", 4))
+        block = payload["challenge"]
+        # Anubis v1.25 nests the challenge: the hashed string is randomData, and
+        # the id must be echoed back or pass-challenge answers 500.
+        challenge = block["randomData"]
+        challenge_id = block["id"]
+        difficulty = int(
+            payload.get("rules", {}).get("difficulty", block.get("difficulty", 4))
+        )
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise ChallengeParseError(f"malformed anubis_challenge block: {exc}") from exc
 
     prefix_match = _PREFIX_RE.search(html)
     prefix = ""
     if prefix_match is not None:
+        # An absent prefix block legitimately means the empty prefix; a present
+        # but unparseable one means the page is not what we think it is.
         try:
             prefix = json.loads(prefix_match.group(1)) or ""
-        except json.JSONDecodeError:
-            prefix = ""
+        except json.JSONDecodeError as exc:
+            raise ChallengeParseError(f"malformed anubis_base_prefix block: {exc}") from exc
 
-    return AnubisChallenge(challenge=challenge, difficulty=difficulty, base_prefix=prefix)
+    return AnubisChallenge(challenge=challenge, challenge_id=challenge_id,
+                           difficulty=difficulty, base_prefix=prefix)
 
 
 def solve(challenge: str, difficulty: int, *, max_attempts: int = 50_000_000) -> tuple[str, int]:
-    """Return (hex_digest, nonce) where sha256(challenge+nonce) has `difficulty` leading zeros."""
+    """Return (hex_digest, nonce) where sha256(challenge+nonce) has `difficulty` leading zeros.
+
+    `difficulty` counts leading zero hex characters: the client's own progress
+    maths uses 16**-difficulty, so difficulty 5 means five zero nibbles.
+    """
     target = "0" * difficulty
     for nonce in range(max_attempts):
         digest = hashlib.sha256(f"{challenge}{nonce}".encode()).hexdigest()
@@ -437,7 +473,8 @@ Detection keys on the response body because Anubis serves its
 interstitial with status 200. The solver has an attempt ceiling so a
 raised difficulty aborts the run instead of spinning.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -611,6 +648,10 @@ class AuthRequired(Exception):
         self.host = host
 
 
+def looks_like_login(text: str) -> bool:
+    return _LOGIN_RE.search(text) is not None
+
+
 def classify(response: httpx.Response) -> Regime:
     if response.status_code in (401, 403):
         return Regime.AUTH_REQUIRED
@@ -656,7 +697,7 @@ from types import TracebackType
 import httpx
 
 from indico_rag.access import anubis
-from indico_rag.access.base import AuthRequired, Regime, classify
+from indico_rag.access.base import AuthRequired, Regime, classify, looks_like_login
 from indico_rag.access.token import apply_token
 
 USER_AGENT = "indico-rag/0.1 (+https://github.com/theHenks/indico-rag)"
@@ -696,18 +737,54 @@ class IndicoClient:
     async def stream_to(self, url: str, dest: Path) -> int:
         """Stream a URL into `dest`, returning the number of bytes written."""
         await self._ensure_prepared(url)
-        written = 0
+        written = await self._stream_checked(url, dest)
+        if written is not None:
+            return written
+
+        # The body was a challenge or a login page rather than the file. Anubis
+        # answers with status 200, so writing it would leave HTML in a .pdf.
+        await self._request("GET", url)
+        written = await self._stream_checked(url, dest)
+        if written is None:
+            raise anubis.ChallengeParseError(
+                f"{url} still answers with a challenge after a solved proof of work"
+            )
+        return written
+
+    async def _stream_checked(self, url: str, dest: Path) -> int | None:
+        """Stream `url` into `dest`, or return None if the body is a challenge page.
+
+        Only HTML bodies are inspected: an attachment may legitimately be an HTML
+        file, and a real one carries none of Anubis's markers.
+        """
         async with self._client.stream("GET", url) as response:
             response.raise_for_status()
+            chunks = response.aiter_bytes(chunk_size=65536)
+            try:
+                first = await anext(chunks)
+            except StopAsyncIteration:
+                first = b""
+
+            if "html" in response.headers.get("content-type", ""):
+                text = first.decode("utf-8", errors="replace")
+                if anubis.is_interstitial(text) or looks_like_login(text):
+                    return None
+
+            written = 0
             with dest.open("wb") as handle:
-                async for chunk in response.aiter_bytes(chunk_size=65536):
+                if first:
+                    handle.write(first)
+                    written += len(first)
+                async for chunk in chunks:
                     handle.write(chunk)
                     written += len(chunk)
         return written
 
     async def _ensure_prepared(self, url: str) -> None:
+        # Detect on the host root, never on `url`: probing the file URL would
+        # fetch the file once here and again in the stream below.
         if self.regime is None:
-            await self._request("GET", url)
+            await self._request("GET", "/")
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         response = await self._client.request(method, path, **kwargs)
@@ -731,13 +808,18 @@ class IndicoClient:
 
         return response
 
-    async def _solve(self, response: httpx.Response) -> None:
-        async with self._solve_lock:
-            probe = await self._client.get(str(response.url))
-            if not anubis.is_interstitial(probe.text):
-                return  # another coroutine solved it while this one waited
+    async def _solve(self, response: httpx.Response, issued_at: float) -> None:
+        """Solve the challenge in `response` unless it is already stale.
 
-            challenge = anubis.parse_challenge(probe.text)
+        `issued_at` is when the request that produced `response` was sent. The
+        cookie is host-wide, so a challenge issued before the last successful
+        solve is already answered and needs no further proof of work.
+        """
+        async with self._solve_lock:
+            if self._last_solved_at is not None and self._last_solved_at > issued_at:
+                return
+
+            challenge = anubis.parse_challenge(response.text)
             started = time.monotonic()
             digest, nonce = await asyncio.to_thread(
                 anubis.solve, challenge.challenge, challenge.difficulty
@@ -747,6 +829,7 @@ class IndicoClient:
             await self._client.get(
                 f"{challenge.base_prefix}/.within.website/x/cmd/anubis/api/pass-challenge",
                 params={
+                    "id": challenge.challenge_id,
                     "response": digest,
                     "nonce": nonce,
                     "redir": str(response.url),
@@ -771,7 +854,8 @@ with status 200 is not mistaken for success. Concurrent requests share
 one cookie jar and re-solve a mid-run challenge under a lock so only one
 coroutine performs the work.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -794,10 +878,17 @@ Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
   - `Event.all_talks() -> list[Talk]`
   - `endpoints.parse_event_ref(text: str, default_host: str | None = None) -> tuple[str, str]` returning `(host, event_id)`
   - `endpoints.timetable_path(event_id) -> str`, `endpoints.contributions_path(event_id) -> str`
-  - `parser.attachments_by_contribution(event_export: dict) -> dict[str, list[Attachment]]`
+  - `parser.attachments_by_contribution(event_export: dict) -> dict[str, list[Attachment]]` keyed by the export's `db_id`
   - `parser.parse_timetable(timetable: dict, *, host: str, event_id: str, event_title: str, attachments: dict[str, list[Attachment]] | None = None) -> Event`
 
-**Note on fixture shape:** Task 1's capture is the authoritative record of Indico's wire format. The code below targets the documented shape and reads every field with `.get()`. If the fixture disagrees, adapt the field names in `parser.py` — the fixture-backed test in Step 1 is what catches the mismatch.
+**Fixture shape, verified against Task 1's capture of event 50058 (NOW 2026, 100 talks).** These are observed facts, not assumptions:
+
+- The two exports use **different contribution identifiers**. The timetable entry carries `contributionId` (e.g. `299881`, an int); the contributions export carries `id` (a *friendly* id like `"297"`) **and** `db_id` (`299922`). Joining on `id` yields **0 matches out of 100**; joining on `db_id` yields **100**. Key the attachment map on `db_id`.
+- Inline timetable attachments are a **dict**, `{"files": [...], "folders": [...]}`, not a list of folders. Their entries carry only `title` and a **site-relative** `download_url`.
+- Export attachments carry the full metadata: absolute `download_url`, `filename`, `content_type`, `size`, `modified_dt`, `checksum`. **Prefer the export and fall back to inline**, because ranking needs upload time and the manifest needs size and content type.
+- A folder's `title` may be `null`; coerce it to `""`.
+- Presenters use `firstName` / `familyName` (plus a combined `name`). Surnames can be multi-word ("Colomer Molla"), so the parser records them rather than letting a later component split on whitespace.
+- `track` and `type` are `null` for every contribution in this event. That is legitimate; the filter facets simply come up empty.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -866,10 +957,17 @@ SYNTHETIC = {
                             "startDate": {"date": "2026-08-31", "time": "09:00:00"},
                             "endDate": {"date": "2026-08-31", "time": "09:30:00"},
                             "presenters": [
-                                {"first_name": "Maria", "last_name": "Rossi",
-                                 "affiliation": "INFN"}
+                                {"firstName": "Maria", "familyName": "Colomer Rossi",
+                                 "affiliation": "INFN", "name": "Colomer Rossi, Maria"}
                             ],
-                            "url": "https://agenda.infn.it/event/50058/contributions/11/",
+                            "url": "/event/50058/contributions/11/",
+                            "attachments": {
+                                "files": [
+                                    {"id": "800", "title": "inline.pdf",
+                                     "download_url": "/event/50058/x/inline.pdf"}
+                                ],
+                                "folders": [],
+                            },
                         },
                         "b1": {
                             "entryType": "Break",
@@ -898,7 +996,8 @@ EXPORT = {
         {
             "contributions": [
                 {
-                    "id": "11",
+                    "id": "9",
+                    "db_id": 11,
                     "folders": [
                         {
                             "title": "Slides",
@@ -911,6 +1010,7 @@ EXPORT = {
                                     "size": 12345,
                                     "content_type": "application/pdf",
                                     "type": "file",
+                                    "modified_dt": "2026-08-20T10:00:00+00:00",
                                 }
                             ],
                         }
@@ -950,12 +1050,15 @@ def test_speakers_and_times_are_parsed():
         SYNTHETIC, host="https://agenda.infn.it", event_id="50058", event_title="Workshop"
     )
     talk = next(t for t in event.all_talks() if t.title == "Welcome and Overview")
-    assert talk.speakers == ["Maria Rossi"]
+    assert talk.speakers == ["Maria Colomer Rossi"]
+    # Multi-word surnames must survive; splitting a full name on whitespace loses them.
+    assert talk.speaker_surnames == ["Colomer Rossi"]
     assert talk.affiliations == ["INFN"]
     assert talk.start.strftime("%H%M") == "0900"
 
 
-def test_attachments_are_joined_onto_talks_by_contribution_id():
+def test_attachments_are_joined_on_db_id_not_the_friendly_id():
+    # The export's own `id` is a friendly number matching nothing in the timetable.
     attachments = attachments_by_contribution(EXPORT)
     assert set(attachments) == {"11"}
     event = parse_timetable(
@@ -967,8 +1070,31 @@ def test_attachments_are_joined_onto_talks_by_contribution_id():
     )
     talk = next(t for t in event.all_talks() if t.contribution_id == "11")
     assert len(talk.attachments) == 1
+    # The export wins over the inline copy: it carries size and content type.
     assert talk.attachments[0].filename == "welcome.pdf"
     assert talk.attachments[0].folder_title == "Slides"
+    assert talk.attachments[0].size == 12345
+
+
+def test_inline_timetable_attachments_are_used_when_the_export_lacks_the_talk():
+    event = parse_timetable(
+        SYNTHETIC, host="https://agenda.infn.it", event_id="50058", event_title="Workshop",
+        attachments={},
+    )
+    talk = next(t for t in event.all_talks() if t.contribution_id == "11")
+    assert [a.filename for a in talk.attachments] == ["inline.pdf"]
+
+
+def test_a_null_folder_title_becomes_an_empty_string():
+    export = {"results": [{"contributions": [
+        {"db_id": 11, "folders": [
+            {"title": None, "attachments": [
+                {"id": "1", "filename": "a.pdf", "download_url": "https://x/a.pdf",
+                 "type": "file"}
+            ]}
+        ]}
+    ]}]}
+    assert attachments_by_contribution(export)["11"][0].folder_title == ""
 
 
 def test_the_captured_event_parses_into_a_non_empty_agenda():
@@ -986,6 +1112,11 @@ def test_the_captured_event_parses_into_a_non_empty_agenda():
     assert talks, "the captured timetable produced no talks"
     assert all(t.title for t in talks), "every talk must have a title"
     assert any(t.attachments for t in talks), "no talk in the capture has attachments"
+    # The join must actually land on the export, whose attachments carry size.
+    # Joining on the wrong identifier yields inline-only attachments with no size.
+    assert any(a.size for t in talks for a in t.attachments), \
+        "attachments carry no size: the export join failed"
+    assert len(talks) == 100, f"expected 100 talks in the capture, got {len(talks)}"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1030,6 +1161,7 @@ class Talk:
     end: datetime | None
     abstract: str = ""
     speakers: list[str] = field(default_factory=list)
+    speaker_surnames: list[str] = field(default_factory=list)
     affiliations: list[str] = field(default_factory=list)
     track: str = ""
     contribution_type: str = ""
@@ -1136,19 +1268,35 @@ def _timestamp(block: dict | None) -> datetime | None:
         return None
 
 
+def _surname(person: dict) -> str:
+    """Indico spells this familyName in timetable entries and last_name in exports."""
+    for key in ("familyName", "last_name", "lastName"):
+        value = person.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def _person_name(person: dict) -> str:
-    explicit = person.get("fullName") or person.get("name")
-    if explicit:
-        return str(explicit).strip()
-    first = person.get("first_name") or person.get("firstName") or ""
-    last = person.get("last_name") or person.get("lastName") or ""
-    return f"{first} {last}".strip()
+    first = person.get("firstName") or person.get("first_name") or ""
+    last = _surname(person)
+    if first or last:
+        return f"{first} {last}".strip()
+    explicit = person.get("name") or person.get("fullName") or ""
+    return str(explicit).strip()
 
 
 def _attachment(raw: dict, folder_title: str) -> Attachment:
     kind = "link" if raw.get("type") == "link" or raw.get("link_url") else "file"
     url = raw.get("download_url") or raw.get("link_url") or raw.get("url") or ""
     filename = raw.get("filename") or raw.get("title") or url.rsplit("/", 1)[-1] or "attachment"
+    modified = raw.get("modified_dt")
+    uploaded = None
+    if isinstance(modified, str):
+        try:
+            uploaded = datetime.fromisoformat(modified)
+        except ValueError:
+            uploaded = None
     return Attachment(
         id=str(raw.get("id", "")),
         filename=filename,
@@ -1156,8 +1304,8 @@ def _attachment(raw: dict, folder_title: str) -> Attachment:
         url=url,
         size=raw.get("size"),
         content_type=raw.get("content_type"),
-        uploaded=_timestamp(raw.get("modified_dt")) if isinstance(raw.get("modified_dt"), dict) else None,
-        folder_title=folder_title,
+        uploaded=uploaded,
+        folder_title=folder_title or "",
     )
 
 
@@ -1166,11 +1314,13 @@ def attachments_by_contribution(event_export: dict) -> dict[str, list[Attachment
     found: dict[str, list[Attachment]] = {}
     for result in event_export.get("results", []):
         for contribution in result.get("contributions", []):
-            key = str(contribution.get("id", ""))
+            # db_id is the identifier the timetable calls contributionId; the
+            # export's own `id` is a friendly number that matches nothing.
+            key = str(contribution.get("db_id") or contribution.get("id", ""))
             items: list[Attachment] = []
-            for folder in contribution.get("folders", []):
-                folder_title = folder.get("title", "")
-                for raw in folder.get("attachments", []):
+            for folder in contribution.get("folders") or []:
+                folder_title = folder.get("title") or ""
+                for raw in folder.get("attachments") or []:
                     items.append(_attachment(raw, folder_title))
             if items:
                 found[key] = items
@@ -1181,12 +1331,21 @@ def _talk(entry: dict, session_title: str, synthetic: bool,
           attachments: dict[str, list[Attachment]] | None) -> Talk:
     contribution_id = str(entry.get("contributionId") or entry.get("db_id") or entry.get("id", ""))
     presenters = entry.get("presenters") or entry.get("speakers") or []
-    inline: list[Attachment] = []
-    for folder in entry.get("folders", []):
-        for raw in folder.get("attachments", []):
-            inline.append(_attachment(raw, folder.get("title", "")))
 
-    resolved = inline or (attachments or {}).get(contribution_id, [])
+    # Inline timetable attachments are {"files": [...], "folders": [...]}, and
+    # carry only a title and a site-relative URL.
+    inline: list[Attachment] = []
+    block = entry.get("attachments") or {}
+    if isinstance(block, dict):
+        for raw in block.get("files", []) or []:
+            inline.append(_attachment(raw, ""))
+        for folder in block.get("folders", []) or []:
+            for raw in folder.get("attachments", []) or []:
+                inline.append(_attachment(raw, folder.get("title") or ""))
+
+    # The export wins: it carries size, content type and upload time, which
+    # ranking and the manifest both need.
+    resolved = (attachments or {}).get(contribution_id) or inline
     return Talk(
         id=str(entry.get("id", "")),
         contribution_id=contribution_id,
@@ -1195,6 +1354,7 @@ def _talk(entry: dict, session_title: str, synthetic: bool,
         end=_timestamp(entry.get("endDate")),
         abstract=entry.get("description", "") or "",
         speakers=[_person_name(p) for p in presenters if _person_name(p)],
+        speaker_surnames=[_surname(p) for p in presenters if _surname(p)],
         affiliations=[p.get("affiliation", "") for p in presenters if p.get("affiliation")],
         track=entry.get("track", "") or "",
         contribution_type=entry.get("type", "") or "",
@@ -1244,14 +1404,22 @@ def parse_timetable(timetable: dict, *, host: str, event_id: str, event_title: s
             elif kind == "Contribution":
                 loose.append(_talk(entry, _UNSCHEDULED, True, attachments))
 
-        ordered = sorted(sessions.values(), key=lambda s: (s.talks[0].start or datetime.min))
+        # Order talks first, then order sessions by their earliest talk: Indico's
+        # `entries` map has no guaranteed order, so a session's first-listed talk
+        # is not necessarily its earliest.
+        for session in sessions.values():
+            session.talks.sort(key=lambda t: (t.start or datetime.min))
+
+        ordered = sorted(
+            sessions.values(),
+            key=lambda s: min((t.start or datetime.min) for t in s.talks),
+        )
         if loose:
+            loose.sort(key=lambda t: (t.start or datetime.min))
             ordered.append(
                 Session(id=f"synthetic-{day_key}", title=_UNSCHEDULED,
                         slug=slugify(_UNSCHEDULED), talks=loose, synthetic=True)
             )
-        for session in ordered:
-            session.talks.sort(key=lambda t: (t.start or datetime.min))
 
         if ordered:
             event.days.append(Day(date=day_date, sessions=ordered))
@@ -1275,7 +1443,8 @@ confined to the parser. Breaks are dropped and contributions outside any
 session are gathered into a synthetic session, so the tree and the
 output layout always have that level.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -1390,7 +1559,7 @@ every row and an override is a single field reassignment.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from indico_rag.model import Attachment, Event, Talk
 
@@ -1423,18 +1592,31 @@ def _format_rank(attachment: Attachment) -> int | None:
     return FORMAT_ORDER.get(attachment.suffix)
 
 
+def _upload_key(uploaded: datetime | None) -> tuple[int, float]:
+    """Sort key for upload recency; a missing upload time sorts last.
+
+    Attachment.uploaded is timezone-aware for real Indico data but may be naive
+    in synthetic data; a naive value is read as UTC so the two are never
+    compared directly. datetime.min is unusable as a sentinel here because
+    datetime.min.timestamp() raises.
+    """
+    if uploaded is None:
+        return (1, 0.0)
+    aware = uploaded if uploaded.tzinfo is not None else uploaded.replace(tzinfo=timezone.utc)
+    return (0, -aware.timestamp())
+
+
 def rank(attachment: Attachment) -> tuple:
     """Sort key; lower is better. Only call on attachments with a usable format."""
     format_rank = _format_rank(attachment)
     assert format_rank is not None
-    uploaded = attachment.uploaded or datetime.min
     text = f"{attachment.folder_title} {attachment.filename}"
     name_rank = 1
     if _PREFERRED.search(text):
         name_rank = 0
     if _DEPRIORITIZED.search(text):
         name_rank = 2
-    return (format_rank, -uploaded.timestamp(), name_rank, attachment.filename)
+    return (format_rank, _upload_key(attachment.uploaded), name_rank, attachment.filename)
 
 
 def choose(talk: Talk) -> Attachment | None:
@@ -1464,7 +1646,8 @@ Ranks by format, then upload time, then folder and filename wording, so
 a talk's chosen file is known before any download starts. Attachments in
 formats no converter handles are never chosen.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -1519,7 +1702,8 @@ def _event() -> Event:
                             size=10, content_type="application/pdf")
     talk = Talk(id="c1", contribution_id="11", title="Welcome",
                 start=datetime(2026, 8, 31, 9, 0), end=datetime(2026, 8, 31, 9, 30),
-                speakers=["Maria Rossi"], attachments=[attachment], chosen=attachment)
+                speakers=["Maria Colomer Rossi"], speaker_surnames=["Colomer Rossi"],
+                attachments=[attachment], chosen=attachment)
     session = Session(id="s1", title="Plenary", slug="plenary", talks=[talk])
     return Event(id="50058", host="https://agenda.infn.it", title="Workshop", slug="workshop",
                  days=[Day(date=date(2026, 8, 31), sessions=[session])])
@@ -1544,6 +1728,7 @@ def test_event_round_trips_through_json():
     restored = event_from_jsonable(event_to_jsonable(_event()))
     talk = restored.all_talks()[0]
     assert talk.title == "Welcome"
+    assert talk.speaker_surnames == ["Colomer Rossi"], "surnames must survive a round trip"
     assert talk.start == datetime(2026, 8, 31, 9, 0)
     assert restored.days[0].date == date(2026, 8, 31)
     assert talk.chosen is not None and talk.chosen.filename == "deck.pdf"
@@ -1647,14 +1832,27 @@ def load_config(root: Path | None = None) -> Config:
     )
 
 
+_TOML_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _toml_string(value: str) -> str:
+    """Render value as a quoted TOML basic string, escaping backslashes and quotes.
+
+    A path containing a backslash or a quote would otherwise produce invalid
+    TOML, since backslash introduces an escape sequence in a basic string.
+    """
+    body = "".join(_TOML_ESCAPES.get(ch, ch) for ch in value)
+    return f'"{body}"'
+
+
 def save_config(config: Config, root: Path | None = None) -> None:
     path = config_root(root) / "config.toml"
     path.write_text(
-        f'output_root = "{config.output_root}"\n'
+        f"output_root = {_toml_string(str(config.output_root))}\n"
         f"download_concurrency = {config.download_concurrency}\n"
         f"convert_concurrency = {config.convert_concurrency}\n"
         f"extract_text = {str(config.extract_text).lower()}\n"
-        f'default_host = "{config.default_host}"\n'
+        f"default_host = {_toml_string(config.default_host)}\n"
     )
 
 
@@ -1697,6 +1895,7 @@ def event_to_jsonable(event: Event) -> dict:
                                 "id": t.id, "contribution_id": t.contribution_id,
                                 "title": t.title, "start": _dt(t.start), "end": _dt(t.end),
                                 "abstract": t.abstract, "speakers": t.speakers,
+                                "speaker_surnames": t.speaker_surnames,
                                 "affiliations": t.affiliations, "track": t.track,
                                 "contribution_type": t.contribution_type, "url": t.url,
                                 "session_title": t.session_title,
@@ -1728,6 +1927,7 @@ def event_from_jsonable(data: dict) -> Event:
                     id=rt["id"], contribution_id=rt["contribution_id"], title=rt["title"],
                     start=_undt(rt.get("start")), end=_undt(rt.get("end")),
                     abstract=rt.get("abstract", ""), speakers=rt.get("speakers", []),
+                    speaker_surnames=rt.get("speaker_surnames", []),
                     affiliations=rt.get("affiliations", []), track=rt.get("track", ""),
                     contribution_type=rt.get("contribution_type", ""), url=rt.get("url", ""),
                     session_title=rt.get("session_title", ""),
@@ -1815,12 +2015,23 @@ def get_token(host: str, root: Path | None = None) -> str | None:
     return _read_json(state_root(root) / "credentials.json").get(_host_key(host))
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write text to a file no one but its owner can read.
+
+    The mode is supplied to open(2) so the file is never created readable and
+    then narrowed; chmod additionally covers a file that already exists.
+    """
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(text)
+    os.chmod(path, 0o600)
+
+
 def set_token(host: str, token: str, root: Path | None = None) -> None:
     path = state_root(root) / "credentials.json"
     data = _read_json(path)
     data[_host_key(host)] = token
-    path.write_text(json.dumps(data, indent=2))
-    os.chmod(path, 0o600)
+    _write_private(path, json.dumps(data, indent=2))
 
 
 def get_host_regime(host: str, root: Path | None = None) -> str | None:
@@ -1849,7 +2060,8 @@ Scans persist the parsed agenda alongside the last selection and output
 directory so reopening one restores both. Tokens live in an owner-only
 file and are never written into a scan.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2103,7 +2315,8 @@ Scanning fetches the timetable and attachment metadata, applies the
 ranking rule, and caches the result, so the chosen file for every talk
 is visible before anything is downloaded.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself — milestone 1: the agenda, end to end**
@@ -2184,7 +2397,14 @@ def test_sanitize_never_returns_empty():
 
 def test_speaker_component_uses_the_first_speakers_surname():
     _, _, _, talk = _fixture(speakers=("Maria Rossi", "Li Chen"))
+    talk.speaker_surnames = ["Rossi", "Chen"]
     assert speaker_component(talk) == "Rossi"
+
+
+def test_speaker_component_keeps_a_multi_word_surname():
+    _, _, _, talk = _fixture(speakers=("Marta Colomer Molla",))
+    talk.speaker_surnames = ["Colomer Molla"]
+    assert speaker_component(talk) == "Colomer-Molla"
 
 
 def test_speaker_component_is_empty_without_speakers():
@@ -2244,18 +2464,35 @@ _RUNS = re.compile(r"-{2,}")
 
 
 def sanitize(text: str, *, max_length: int = 80) -> str:
-    """Make one path component out of arbitrary text, preserving legal unicode."""
+    """Make one path component out of arbitrary text, preserving legal unicode.
+
+    `max_length` bounds both the character count and the UTF-8 encoded byte
+    count of the result. A character-only cap is not enough: 80 characters of
+    CJK or other multi-byte text can still encode to well over 255 bytes,
+    which is the component-length limit most filesystems enforce.
+    """
     normalized = unicodedata.normalize("NFC", text).strip()
     cleaned = _ILLEGAL.sub("-", normalized)
     cleaned = _SEPARATORS.sub("-", cleaned)
     cleaned = _RUNS.sub("-", cleaned).strip("-. ")
-    return cleaned[:max_length].strip("-. ") or "untitled"
+    cleaned = cleaned[:max_length].strip("-. ")
+    encoded = cleaned.encode("utf-8")
+    if len(encoded) > max_length:
+        cleaned = encoded[:max_length].decode("utf-8", errors="ignore").strip("-. ")
+    return cleaned or "untitled"
 
 
 def speaker_component(talk: Talk) -> str:
-    if not talk.speakers:
-        return ""
-    return sanitize(talk.speakers[0].split()[-1], max_length=40)
+    """The first speaker's surname.
+
+    Uses the surname Indico reported rather than the last whitespace-separated
+    word of the full name, which would turn "Colomer Molla" into "Molla".
+    """
+    if talk.speaker_surnames:
+        return sanitize(talk.speaker_surnames[0], max_length=40)
+    if talk.speakers:
+        return sanitize(talk.speakers[0].split()[-1], max_length=40)
+    return ""
 
 
 def event_dir(root: Path, event: Event) -> Path:
@@ -2271,13 +2508,20 @@ def destination(root: Path, event: Event, day: Day, session: Session, talk: Talk
 
 
 def deduplicate(path: Path, taken: set[Path]) -> Path:
-    """Return `path`, or the first free `<stem>-<n>` variant when it is already taken."""
-    if path not in taken:
+    """Return `path`, or the first free `<stem>-<n>` variant when it is already taken.
+
+    Comparison folds case. On a case-insensitive filesystem two names differing
+    only in case are one file, so treating them as distinct would let one talk
+    silently overwrite another; folding case also makes the output identical on
+    every platform.
+    """
+    claimed = {str(existing).casefold() for existing in taken}
+    if str(path).casefold() not in claimed:
         return path
     counter = 2
     while True:
         candidate = path.with_name(f"{path.stem}-{counter}{path.suffix}")
-        if candidate not in taken:
+        if str(candidate).casefold() not in claimed:
             return candidate
         counter += 1
 ```
@@ -2297,7 +2541,8 @@ Names carry start time, first speaker's surname and title, capped in
 length and stripped of characters the filesystem rejects. Two talks
 sharing a time and speaker are separated by a numeric suffix.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2581,7 +2826,8 @@ without converting. Every conversion runs under a timeout followed by a
 kill, and a run that produces no PDF raises rather than leaving an empty
 file behind.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2707,7 +2953,8 @@ Writes one text sidecar per talk using pypdfium2. An image-only deck
 yields little text; that is recorded as a character count rather than
 treated as a failure.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -2922,7 +3169,8 @@ the checksum that decides whether a re-run can skip the talk. Only a
 completed record whose file is still present and unchanged counts as
 complete, so failures are retried.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -3445,7 +3693,8 @@ never waits on the converter. Failures are isolated per talk and land in
 both the manifest and the closing summary; a failed conversion keeps the
 original file.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself — milestone 2: real downloads, no interface yet**
@@ -3876,7 +4125,8 @@ accumulates across successive filters instead of replacing the previous
 choice. An unparseable regular expression raises rather than falling
 back to substring matching, which would silently show a different set.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -4218,7 +4468,8 @@ file each talk would produce. Selecting every shown talk accumulates
 across filters, and an unparseable regular expression is reported in the
 status line instead of silently matching something else.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -4493,7 +4744,8 @@ selection; the new-event screen accepts a pasted URL or a bare id and
 reports each scan stage, so the seconds spent on a proof of work do not
 look like a hang.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 ---
@@ -4693,7 +4945,8 @@ A bare indico-rag now opens the home screen, and the four screens pass
 an event from scan through selection to download. The closing summary
 lists every failure with its reason.
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 > **Try it yourself — milestone 3: the whole tool**
@@ -4744,7 +4997,8 @@ uv run pytest -v
 git add -A
 git commit -m "Add README and MIT licence
 
-Assisted-by: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018ZHVctiRLWSFUGrkVvhoXr"
 ```
 
 - [ ] **Step 5: Create the remote and push**
