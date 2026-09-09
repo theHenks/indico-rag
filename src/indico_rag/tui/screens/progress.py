@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from rich.text import Text
 from textual.widgets import DataTable, Footer, Header, Static
@@ -30,6 +31,11 @@ def summary_lines(summary: Summary) -> list[str]:
 
 class ProgressScreen(Screen):
     """One row per talk. The failure list is the output that matters here."""
+
+    BINDINGS = [
+        Binding("escape", "leave", "back"),
+        Binding("q", "leave", "back"),
+    ]
 
     def __init__(self, event: Event, selected: set[str], output_root: Path, config: Config,
                  token: str | None = None) -> None:
@@ -59,6 +65,12 @@ class ProgressScreen(Screen):
         self._finished = 0
         self._render_counts()
         self.run_worker(self._run(), exclusive=True)
+
+    def action_leave(self) -> None:
+        """Return to the previous screen, stopping the run if it is still going."""
+        if self.summary is None:
+            self.workers.cancel_all()
+        self.dismiss(None)
 
     def _render_counts(self) -> None:
         self.query_one("#summary", Static).update(

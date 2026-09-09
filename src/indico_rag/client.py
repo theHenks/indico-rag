@@ -23,8 +23,8 @@ USER_AGENT = "indico-rag/0.1 (+https://github.com/theHenks/indico-rag)"
 
 # A challenge answered by one download can be superseded by another still in
 # flight, so a stream gets a few attempts before the talk is called failed.
-_STREAM_ATTEMPTS = 4
-_STREAM_BACKOFF = 0.5
+_STREAM_ATTEMPTS = 6
+_STREAM_BACKOFF = 1.0
 
 
 class IndicoClient:
@@ -47,6 +47,12 @@ class IndicoClient:
         apply_token(self._client, token)
         self._solve_lock = asyncio.Lock()
         self._prepare_lock = asyncio.Lock()
+        # Closed while a challenge is being answered. Any request issued in
+        # that window draws a challenge of its own, and Anubis tracks only one
+        # outstanding challenge per client, so the answer being computed would
+        # stop matching the cookie and the whole run would re-challenge itself.
+        self._open = asyncio.Event()
+        self._open.set()
         self._last_solved_at: float | None = None
         self.warning: str | None = None
 
@@ -111,13 +117,14 @@ class IndicoClient:
             f"{url} still answers with a challenge after {_STREAM_ATTEMPTS} attempts"
         ) from last_error
 
-    async def _stream_checked(self, url: str, dest: Path) -> int | None:
+    async def _stream_checked(self, url: str, dest: Path) -> int | None:  # noqa: C901
         """Stream `url` into `dest`, or return None if it is a login or challenge page.
 
         A redirect through a login page is checked regardless of content type.
         Otherwise, only HTML bodies are inspected: an attachment may legitimately
         be an HTML file, and a real one carries none of Anubis's markers.
         """
+        await self._open.wait()
         async with self._client.stream("GET", url) as response:
             response.raise_for_status()
             if redirected_through_login(response):
@@ -168,6 +175,7 @@ class IndicoClient:
                 await self._request("GET", url, headers={"Range": "bytes=0-0"})
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        await self._open.wait()
         issued_at = time.monotonic()
         response = await self._client.request(method, path, **kwargs)
         regime = classify(response)
@@ -207,32 +215,39 @@ class IndicoClient:
         valid and no further proof of work is needed.
         """
         async with self._solve_lock:
-            response = await self._client.request(method, path, **kwargs)
-            if classify(response) is not Regime.PROOF_OF_WORK:
-                return response
+            self._open.clear()
+            try:
+                return await self._answer_challenge(method, path, **kwargs)
+            finally:
+                self._open.set()
 
-            challenge = anubis.parse_challenge(response.text)
-            started = time.monotonic()
-            digest, nonce = await asyncio.to_thread(
-                anubis.solve, challenge.challenge, challenge.difficulty
-            )
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-
-            await self._client.get(
-                f"{challenge.base_prefix}/.within.website/x/cmd/anubis/api/pass-challenge",
-                params={
-                    "id": challenge.challenge_id,
-                    "response": digest,
-                    "nonce": nonce,
-                    "redir": str(response.url),
-                    "elapsedTime": elapsed_ms,
-                },
-            )
-            self._last_solved_at = time.monotonic()
-
-            response = await self._client.request(method, path, **kwargs)
-            if classify(response) is Regime.PROOF_OF_WORK:
-                raise anubis.ChallengeParseError(
-                    f"{self.host} still challenges after a solved proof of work"
-                )
+    async def _answer_challenge(self, method: str, path: str, **kwargs) -> httpx.Response:
+        response = await self._client.request(method, path, **kwargs)
+        if classify(response) is not Regime.PROOF_OF_WORK:
             return response
+
+        challenge = anubis.parse_challenge(response.text)
+        started = time.monotonic()
+        digest, nonce = await asyncio.to_thread(
+            anubis.solve, challenge.challenge, challenge.difficulty
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+
+        await self._client.get(
+            f"{challenge.base_prefix}/.within.website/x/cmd/anubis/api/pass-challenge",
+            params={
+                "id": challenge.challenge_id,
+                "response": digest,
+                "nonce": nonce,
+                "redir": str(response.url),
+                "elapsedTime": elapsed_ms,
+            },
+        )
+        self._last_solved_at = time.monotonic()
+
+        response = await self._client.request(method, path, **kwargs)
+        if classify(response) is Regime.PROOF_OF_WORK:
+            raise anubis.ChallengeParseError(
+                f"{self.host} still challenges after a solved proof of work"
+            )
+        return response

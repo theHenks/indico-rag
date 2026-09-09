@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from textual.app import App
+from textual.binding import Binding
 
 from indico_rag import store
 from indico_rag.model import Event
@@ -18,6 +19,7 @@ class IndicoRagApp(App):
 
     CSS = ""
     TITLE = "indico-rag"
+    BINDINGS = [Binding("ctrl+q", "quit", "quit", priority=True)]
 
     def __init__(self, state_root: Path | None = None) -> None:
         super().__init__()
