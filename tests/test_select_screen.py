@@ -217,3 +217,32 @@ async def test_the_captured_event_renders_and_select_visible_matches_measured_ma
         # and the download stage records the materialless one separately.
         assert len(screen.state.selected) == 100
         assert screen.state.selected == {t.contribution_id for t in talks}
+
+
+async def test_space_toggles_the_row_under_the_cursor(tmp_path):
+    """The tree must hold focus and carry a cursor for space to act on.
+
+    Disabling auto-focus keeps the filter input from swallowing letter keys,
+    but it also leaves nothing focused unless the tree is focused explicitly,
+    and a tree without a cursor has no row to toggle. Tree also binds space to
+    expanding a node, so the key has to be reassigned rather than inherited.
+    """
+    app = IndicoRagApp()
+    async with app.run_test() as pilot:
+        screen = SelectScreen(_event(), tmp_path)
+        await app.push_screen(screen)
+        await pilot.pause()
+
+        tree = screen.query_one("#agenda")
+        assert tree.has_focus, "the tree must be focused for space to reach a row"
+        assert tree.cursor_node is not None and tree.cursor_node.data is not None, (
+            "the cursor must start on a selectable row, not the root"
+        )
+
+        await pilot.press("space")
+        await pilot.pause()
+        assert screen.state.selected, "space selected nothing"
+
+        await pilot.press("space")
+        await pilot.pause()
+        assert not screen.state.selected, "space did not deselect"

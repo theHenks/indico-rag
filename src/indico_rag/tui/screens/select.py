@@ -32,6 +32,20 @@ def talk_label(talk: Talk, selected: bool) -> str:
     return f"{_BOX['all' if selected else 'none']} {clock}  {talk.title}{who}  [{marker}]"
 
 
+class AgendaTree(Tree):
+    """The agenda tree, with space reassigned from expanding to selecting.
+
+    Tree binds space to toggle_node, and a focused widget's binding wins over
+    the screen's, so the tree must give the key up deliberately. Expanding and
+    collapsing remain on the arrow keys.
+    """
+
+    BINDINGS = [Binding("space", "toggle_selection", "toggle", show=False)]
+
+    def action_toggle_selection(self) -> None:
+        self.screen.action_toggle()
+
+
 class SelectScreen(Screen):
     """Choose talks. Filtering narrows what is shown; it never alters the selection."""
 
@@ -73,19 +87,26 @@ class SelectScreen(Screen):
         yield Header()
         with Horizontal():
             yield Input(placeholder="filter (ctrl+r for regex)", id="filter")
-        yield Tree("agenda", id="agenda")
+        yield AgendaTree("agenda", id="agenda")
         yield Static(id="status")
         yield Footer()
 
     def on_mount(self) -> None:
+        # The root is a container for the days, not something to select, and
+        # leaving it visible would put the cursor on a row that toggles nothing.
+        self.query_one("#agenda", AgendaTree).show_root = False
         self.refresh_tree()
+        # The tree carries the cursor that space, o and d act on, so it must
+        # hold focus. Auto-focus is off because it would land on the filter
+        # input instead, where every letter would be typed rather than bound.
+        self.query_one("#agenda", AgendaTree).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self.spec.text = event.value
         self.refresh_tree()
 
     def refresh_tree(self) -> None:
-        tree: Tree = self.query_one("#agenda", Tree)
+        tree: AgendaTree = self.query_one("#agenda", AgendaTree)
         try:
             self.shown = visible_talks(self.event, self.spec)
             self.status_text = ""
@@ -121,6 +142,9 @@ class SelectScreen(Screen):
                         Text(talk_label(talk, self.state.is_selected(talk.contribution_id))),
                         data=("talk", talk),
                     )
+
+        if tree.cursor_line < 0 and tree.last_line >= 0:
+            tree.cursor_line = 0
 
         mode = "regex" if self.spec.regex else "substring"
         counts = f"{self.state.count} selected · {len(self.shown)} shown · filter: {mode}"
