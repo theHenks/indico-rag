@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -120,14 +121,24 @@ async def test_insufficient_scope_when_anonymous_retry_also_fails_raises_auth_re
 
 @respx.mock
 async def test_challenge_is_solved_once_then_the_request_is_replayed():
-    target = respx.get(f"{HOST}/export/timetable/1.json")
-    target.side_effect = [
-        httpx.Response(200, html=INTERSTITIAL),
-        httpx.Response(200, json={"results": {"ok": True}}),
-    ]
+    # The host keeps challenging until a challenge is actually passed, which is
+    # what makes the solve necessary rather than incidental.
+    solved = {"done": False}
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if solved["done"]:
+            return httpx.Response(200, json={"results": {"ok": True}})
+        return httpx.Response(200, html=INTERSTITIAL)
+
+    target = respx.get(f"{HOST}/export/timetable/1.json").mock(side_effect=responder)
+
+    def pass_responder(request: httpx.Request) -> httpx.Response:
+        solved["done"] = True
+        return httpx.Response(200, html="<html>ok</html>")
+
     passer = respx.get(
         url__startswith=f"{HOST}/.within.website/x/cmd/anubis/api/pass-challenge"
-    ).mock(return_value=httpx.Response(200, html="<html>ok</html>"))
+    ).mock(side_effect=pass_responder)
 
     async with IndicoClient(HOST) as client:
         data = await client.get_json("/export/timetable/1.json")
@@ -135,7 +146,58 @@ async def test_challenge_is_solved_once_then_the_request_is_replayed():
     assert data == {"results": {"ok": True}}
     assert client.regime is Regime.PROOF_OF_WORK
     assert passer.call_count == 1
-    assert target.call_count == 2
+
+
+@respx.mock
+async def test_concurrent_downloads_pass_only_one_challenge(tmp_path):
+    """Concurrent first requests must not each be issued their own challenge.
+
+    Anubis names the outstanding challenge in a cookie, so challenges issued
+    in parallel overwrite one another and the one that is solved no longer
+    matches, leaving every retry challenged. Only one may be outstanding.
+    """
+    pdf = b"%PDF-1.4 x"
+    outstanding = {"count": 0, "peak": 0}
+    solved = {"done": False}
+
+    def challenge_or(body: httpx.Response):
+        def responder(request: httpx.Request) -> httpx.Response:
+            if solved["done"]:
+                return body
+            outstanding["count"] += 1
+            return httpx.Response(200, html=INTERSTITIAL)
+        return responder
+
+    respx.get(f"{HOST}/").mock(side_effect=challenge_or(httpx.Response(200, json={})))
+    for index in range(6):
+        respx.get(f"{HOST}/files/{index}.pdf").mock(
+            side_effect=challenge_or(
+                httpx.Response(200, content=pdf, headers={"content-type": "application/pdf"})
+            )
+        )
+
+    def pass_responder(request: httpx.Request) -> httpx.Response:
+        solved["done"] = True
+        return httpx.Response(200, html="<html>ok</html>")
+
+    passer = respx.get(
+        url__startswith=f"{HOST}/.within.website/x/cmd/anubis/api/pass-challenge"
+    ).mock(side_effect=pass_responder)
+
+    async with IndicoClient(HOST) as client:
+        results = await asyncio.gather(*(
+            client.stream_to(f"{HOST}/files/{index}.pdf", tmp_path / f"{index}.pdf")
+            for index in range(6)
+        ))
+
+    assert results == [len(pdf)] * 6
+    assert all((tmp_path / f"{index}.pdf").read_bytes() == pdf for index in range(6))
+    assert passer.call_count == 1
+    # One challenge per download is the regression: six parallel first requests
+    # each drew their own, and the solved one no longer matched the cookie.
+    assert outstanding["count"] <= 2, (
+        f"{outstanding['count']} challenges were issued for 6 downloads"
+    )
 
 
 @respx.mock

@@ -238,11 +238,15 @@ async def test_a_second_run_skips_completed_talks(tmp_path):
     jobs, none = build_jobs(event, {"1"}, tmp_path)
     await run_jobs(event, jobs, none, config=_config(tmp_path), root=tmp_path)
 
+    # The first run also spends one ranged request establishing the challenge
+    # cookie, so what resume must leave untouched is the count, not its value.
+    after_first_run = route.call_count
+
     jobs2, none2 = build_jobs(event, {"1"}, tmp_path)
     summary = await run_jobs(event, jobs2, none2, config=_config(tmp_path), root=tmp_path)
 
     assert summary.skipped == 1
-    assert route.call_count == 1, "a completed talk must not be re-fetched"
+    assert route.call_count == after_first_run, "a completed talk must not be re-fetched"
 
 
 @respx.mock

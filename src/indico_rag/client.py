@@ -21,6 +21,11 @@ from indico_rag.access.token import apply_token
 
 USER_AGENT = "indico-rag/0.1 (+https://github.com/theHenks/indico-rag)"
 
+# A challenge answered by one download can be superseded by another still in
+# flight, so a stream gets a few attempts before the talk is called failed.
+_STREAM_ATTEMPTS = 4
+_STREAM_BACKOFF = 0.5
+
 
 class IndicoClient:
     """Fetch JSON and files from one Indico host, solving Anubis when required.
@@ -41,6 +46,7 @@ class IndicoClient:
         )
         apply_token(self._client, token)
         self._solve_lock = asyncio.Lock()
+        self._prepare_lock = asyncio.Lock()
         self._last_solved_at: float | None = None
         self.warning: str | None = None
 
@@ -74,21 +80,36 @@ class IndicoClient:
             )
 
     async def stream_to(self, url: str, dest: Path) -> int:
-        """Stream a URL into `dest`, returning the number of bytes written."""
-        await self._ensure_prepared(url)
-        written = await self._stream_checked(url, dest)
-        if written is not None:
-            return written
+        """Stream a URL into `dest`, returning the number of bytes written.
 
-        # The body was a challenge or a login page rather than the file. Anubis
-        # answers with status 200, so writing it would leave HTML in a .pdf.
-        await self._request("GET", url)
-        written = await self._stream_checked(url, dest)
-        if written is None:
-            raise anubis.ChallengeParseError(
-                f"{url} still answers with a challenge after a solved proof of work"
-            )
-        return written
+        A challenge met mid-run is treated as transient. Downloads run in
+        parallel and each is challenged on its own, so one being answered while
+        others are still in flight can leave a request holding a challenge that
+        no longer matches the cookie. The auth cookie is host-wide and long
+        lived, so the answer is to let another attempt pick up whichever solve
+        lands first rather than to fail the talk.
+        """
+        await self._ensure_prepared(url)
+
+        last_error: Exception | None = None
+        for attempt in range(_STREAM_ATTEMPTS):
+            written = await self._stream_checked(url, dest)
+            if written is not None:
+                return written
+
+            # The body was a challenge or a login page rather than the file.
+            # Anubis answers with status 200, so writing it would leave HTML in
+            # a .pdf.
+            try:
+                await self._request("GET", url)
+            except anubis.ChallengeParseError as exc:
+                last_error = exc
+            if attempt + 1 < _STREAM_ATTEMPTS:
+                await asyncio.sleep(_STREAM_BACKOFF * (attempt + 1))
+
+        raise anubis.ChallengeParseError(
+            f"{url} still answers with a challenge after {_STREAM_ATTEMPTS} attempts"
+        ) from last_error
 
     async def _stream_checked(self, url: str, dest: Path) -> int | None:
         """Stream `url` into `dest`, or return None if it is a login or challenge page.
@@ -124,10 +145,27 @@ class IndicoClient:
         return written
 
     async def _ensure_prepared(self, url: str) -> None:
-        # Detect on the host root, never on `url`: probing the file URL would
-        # fetch the file once here and again in the stream below.
-        if self.regime is None:
-            await self._request("GET", "/")
+        """Obtain the host's challenge cookie once, before concurrent work starts.
+
+        The probe asks for the first byte of `url` rather than the host root:
+        a root page is often served without a challenge, so probing it settles
+        the regime while leaving the cookie jar empty, and every later download
+        is then challenged on its own. Requesting a single byte of the real
+        target is challenged exactly as the download will be, and costs
+        nothing to discard.
+
+        The lock matters as much as the probe. Anubis names its outstanding
+        challenge in a cookie, so several requests racing for a first challenge
+        are issued several that overwrite one another in the shared jar; the
+        one that then gets solved no longer matches, and every retry is
+        challenged afresh. Letting exactly one request establish the cookie
+        removes the race.
+        """
+        if self.regime is not None:
+            return
+        async with self._prepare_lock:
+            if self.regime is None:
+                await self._request("GET", url, headers={"Range": "bytes=0-0"})
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         issued_at = time.monotonic()
@@ -135,13 +173,8 @@ class IndicoClient:
         regime = classify(response)
 
         if regime is Regime.PROOF_OF_WORK:
-            await self._solve(response, issued_at)
-            response = await self._client.request(method, path, **kwargs)
+            response = await self._pass_challenge(method, path, **kwargs)
             regime = classify(response)
-            if regime is Regime.PROOF_OF_WORK:
-                raise anubis.ChallengeParseError(
-                    f"{self.host} still challenges after a solved proof of work"
-                )
             self.regime = Regime.PROOF_OF_WORK
         else:
             self.regime = regime
@@ -163,17 +196,20 @@ class IndicoClient:
 
         return response
 
-    async def _solve(self, response: httpx.Response, issued_at: float) -> None:
-        """Solve the Anubis challenge in `response`, unless it is already stale.
+    async def _pass_challenge(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Clear an Anubis challenge and return the answered response.
 
-        `issued_at` is when the request that produced `response` was sent. A
-        challenge is server-wide: once any request solves one, the shared
-        cookie jar authenticates every pending request, so a challenge issued
-        before the last solve is answered without redoing the proof of work.
+        The lock is held across the whole cycle so only one challenge is ever
+        outstanding: Anubis tracks the pending challenge in a cookie, and two
+        challenges issued concurrently overwrite each other in the shared jar,
+        leaving the solved one unmatched. A coroutine that waited retries first,
+        because the coroutine ahead of it has usually already made the cookie
+        valid and no further proof of work is needed.
         """
         async with self._solve_lock:
-            if self._last_solved_at is not None and self._last_solved_at > issued_at:
-                return
+            response = await self._client.request(method, path, **kwargs)
+            if classify(response) is not Regime.PROOF_OF_WORK:
+                return response
 
             challenge = anubis.parse_challenge(response.text)
             started = time.monotonic()
@@ -193,3 +229,10 @@ class IndicoClient:
                 },
             )
             self._last_solved_at = time.monotonic()
+
+            response = await self._client.request(method, path, **kwargs)
+            if classify(response) is Regime.PROOF_OF_WORK:
+                raise anubis.ChallengeParseError(
+                    f"{self.host} still challenges after a solved proof of work"
+                )
+            return response
