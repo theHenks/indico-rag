@@ -176,3 +176,27 @@ def test_counts_reports_an_unexpected_status_rather_than_dropping_it(tmp_path):
     manifest.add(_record(tmp_path, status="weird_status"))
     counts = manifest.counts()
     assert counts.get("weird_status") == 1
+
+
+from indico_rag.pipeline.manifest import EventInfo
+
+
+def test_event_info_round_trips(tmp_path):
+    path = tmp_path / "_manifest.json"
+    manifest = Manifest.load(path)
+    manifest.event = EventInfo(host="https://agenda.infn.it", id="50058", title="NOW 2026")
+    manifest.add(_record(tmp_path))
+    manifest.save()
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["event"] == {
+        "host": "https://agenda.infn.it", "id": "50058", "title": "NOW 2026",
+        "url": "https://agenda.infn.it/event/50058/",
+    }
+    assert Manifest.load(path).event == manifest.event
+
+
+def test_a_manifest_without_event_info_still_loads(tmp_path):
+    path = tmp_path / "_manifest.json"
+    path.write_text(json.dumps({"counts": {}, "talks": {}}), encoding="utf-8")
+    assert Manifest.load(path).event is None

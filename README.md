@@ -106,6 +106,9 @@ produced nothing. Each entry carries the Indico contribution URL, the original
 attachment URL, a checksum, whether conversion was needed, and the outcome. It is
 also what makes a re-run skip completed work.
 
+It also records the event itself under `event`: the host, the event id and title,
+and the event URL. Each talk's `indico_url` is relative to that host.
+
 ## Authentication
 
 Public events need nothing. An instance that requires logging in will ask, once,

@@ -19,7 +19,7 @@ from indico_rag.indico.ranking import google_slides_pdf_url, is_google_slides
 from indico_rag.model import Attachment, Day, Event, Session, Talk
 from indico_rag.pipeline.convert import ConversionError, convert_to_pdf, needs_conversion
 from indico_rag.pipeline.extract import write_sidecar
-from indico_rag.pipeline.manifest import MANIFEST_NAME, Manifest, TalkRecord, sha256_of
+from indico_rag.pipeline.manifest import MANIFEST_NAME, EventInfo, Manifest, TalkRecord, sha256_of
 from indico_rag.pipeline.paths import deduplicate, destination, event_dir
 from indico_rag.store import Config
 
@@ -205,6 +205,7 @@ async def run_jobs(event: Event, jobs: list[Job], no_material: list[Talk], *, co
     report: Update = on_update or (lambda *_: None)
     manifest_path = event_dir(root, event) / MANIFEST_NAME
     manifest = Manifest.load(manifest_path)
+    manifest.event = EventInfo(host=event.host, id=event.id, title=event.title)
     summary = Summary()
 
     for talk in no_material:

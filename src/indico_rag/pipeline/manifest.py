@@ -56,10 +56,23 @@ class TalkRecord:
     error: str | None
 
 
+@dataclass(frozen=True)
+class EventInfo:
+    """The event a manifest belongs to. `host` includes the scheme."""
+    host: str
+    id: str
+    title: str
+
+    @property
+    def url(self) -> str:
+        return f"{self.host}/event/{self.id}/"
+
+
 @dataclass
 class Manifest:
     path: Path
     records: dict[str, TalkRecord] = field(default_factory=dict)
+    event: EventInfo | None = None
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
@@ -67,7 +80,11 @@ class Manifest:
             return cls(path=path)
         payload = json.loads(path.read_text(encoding="utf-8"))
         records = {key: TalkRecord(**value) for key, value in payload.get("talks", {}).items()}
-        return cls(path=path, records=records)
+        raw_event = payload.get("event")
+        event = None
+        if raw_event is not None:
+            event = EventInfo(host=raw_event["host"], id=raw_event["id"], title=raw_event["title"])
+        return cls(path=path, records=records, event=event)
 
     def add(self, record: TalkRecord) -> None:
         self.records[record.contribution_id] = record
@@ -95,10 +112,11 @@ class Manifest:
         a truncated file that fails to parse on the next resume, which would
         discard every record written so far."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "counts": self.counts(),
-            "talks": {key: asdict(value) for key, value in self.records.items()},
-        }
+        payload: dict = {}
+        if self.event is not None:
+            payload["event"] = {**asdict(self.event), "url": self.event.url}
+        payload["counts"] = self.counts()
+        payload["talks"] = {key: asdict(value) for key, value in self.records.items()}
         fd, tmp_name = tempfile.mkstemp(
             dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp"
         )
